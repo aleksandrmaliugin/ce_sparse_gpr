@@ -13,7 +13,7 @@ import torch
 from ase.io import read, write
 from ase.io.trajectory import Trajectory
 
-from mc_grand_utils import (
+from mc_grand_calculator_utils import (
     KB_EV,
     AdsorptionSite,
     EnergyComponents,
@@ -44,6 +44,7 @@ from mc_grand_utils import (
 
 from ce_sparse_gpr.ce_extractor import ClusterExpansion
 from ce_sparse_gpr.gpr import SparseAtomicGPR
+from ce_sparse_gpr.calculator import CalculatorCESparseGPR
 
 
 @dataclass
@@ -63,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Serial Metropolis MC for Pt/Pd + semi-grand-canonical CO. "
-            "This version uses local descriptor-cache updates and reports theta_CO relative to the number of ontop sites."
+            "This version evaluates every trial structure through CalculatorCESparseGPR and reports theta_CO relative to the number of ontop sites."
         )
     )
 
@@ -965,6 +966,141 @@ class LocalDescriptorEnergyEvaluator:
 
 
 
+
+def _scalar_to_float(value, name: str) -> float:
+    """Convert a scalar-like tensor/array/object to float."""
+    if torch.is_tensor(value):
+        value = value.detach().cpu().reshape(-1).sum().item()
+    else:
+        value = np.asarray(value, dtype=float).reshape(-1).sum()
+    return finite_float(value, name)
+
+
+class CalculatorEnergyEvaluator:
+    """Full-structure evaluator based on CalculatorCESparseGPR.
+
+    This is intentionally slower than LocalDescriptorEnergyEvaluator: every
+    trial move rebuilds the adsorbed ASE structure and asks the calculator to
+    recompute all required descriptors.  The MC move set and output format are
+    kept identical to the local-descriptor version, which makes this script a
+    useful correctness/reference implementation.
+    """
+
+    def __init__(
+        self,
+        file_slab_model: str,
+        file_ads_model: str,
+        file_rep_model: str | None,
+        sites: Iterable[AdsorptionSite],
+        co_bond: float,
+        device: str = "cpu",
+        allow_unsafe_load: bool = False,
+        local_cutoff_margin: float = 0.05,
+    ):
+        self.device = device
+        self.sites = validate_sites(list(sites))
+        self.co_bond = positive_float(co_bond, "co_bond")
+        self.allow_unsafe_load = bool(allow_unsafe_load)
+        self.local_cutoff_margin = nonnegative_float(local_cutoff_margin, "local_cutoff_margin")
+
+        signature = inspect.signature(CalculatorCESparseGPR)
+        kwargs = {
+            "file_slab_model": file_slab_model,
+            "file_ads_model": file_ads_model,
+            "file_rep_model": file_rep_model,
+            "device": device,
+        }
+        if "allow_unsafe_load" in signature.parameters:
+            kwargs["allow_unsafe_load"] = bool(allow_unsafe_load)
+
+        self.calculator = CalculatorCESparseGPR(**kwargs)
+
+    def make_atoms(self, slab_atoms, occupation: np.ndarray):
+        return build_adsorbed_structure(
+            slab_atoms=slab_atoms,
+            sites=self.sites,
+            occupation=occupation,
+            co_bond=self.co_bond,
+        )
+
+    def cutoffs(self) -> dict[str, float]:
+        return {"slab": float("nan"), "ads": float("nan"), "rep": float("nan")}
+
+    def initial_state(
+        self,
+        slab_atoms,
+        occupation: np.ndarray | None = None,
+        compute_uncertainty: bool = False,
+    ) -> LocalMCState:
+        if occupation is None:
+            occupation = np.zeros(len(self.sites), dtype=bool)
+        else:
+            occupation = validate_occupation(occupation, len(self.sites))
+        return self.full_rebuild(slab_atoms, occupation, compute_uncertainty=compute_uncertainty)
+
+    def full_rebuild(self, slab_atoms, occupation: np.ndarray, compute_uncertainty: bool = False) -> LocalMCState:
+        occupation = validate_occupation(occupation, len(self.sites))
+        validate_sites(self.sites, n_atoms=len(slab_atoms))
+        atoms = self.make_atoms(slab_atoms, occupation)
+        energy = self._evaluate_atoms(atoms, compute_uncertainty=compute_uncertainty)
+        return LocalMCState(
+            slab_atoms=slab_atoms.copy(),
+            occupation=occupation.copy(),
+            energy=energy,
+            slab_k={},
+            ads_k={},
+            rep_k={},
+        )
+
+    def local_update(
+        self,
+        state: LocalMCState,
+        candidate_slab_atoms,
+        candidate_occupation: np.ndarray,
+        *,
+        changed_metal_indices: Iterable[int] = (),
+        changed_site_ids: Iterable[int] = (),
+        compute_uncertainty: bool = False,
+    ) -> LocalMCState:
+        # The Calculator version deliberately ignores the local invalidation
+        # hints and evaluates the complete candidate structure.
+        return self.full_rebuild(
+            candidate_slab_atoms,
+            candidate_occupation,
+            compute_uncertainty=compute_uncertainty,
+        )
+
+    def _evaluate_atoms(self, atoms, compute_uncertainty: bool = False) -> EnergyComponents:
+        if compute_uncertainty:
+            result = self.calculator.predict_energy_and_uncertainty(atoms)
+            slab_energy, total_energy, ads_energy, rep_energy, total_uncertainty, component_uncertainties = result[:6]
+            slab_unc = component_uncertainties.get("slab", float("nan"))
+            ads_unc = component_uncertainties.get("ads", float("nan"))
+            rep_unc = component_uncertainties.get("rep", float("nan"))
+            return EnergyComponents(
+                total=_scalar_to_float(total_energy, "total_energy"),
+                slab=_scalar_to_float(slab_energy, "slab_energy"),
+                ads=_scalar_to_float(ads_energy, "ads_energy"),
+                rep=_scalar_to_float(rep_energy, "rep_energy"),
+                uncertainty=_scalar_to_float(total_uncertainty, "total_uncertainty"),
+                uncertainty_slab=_scalar_to_float(slab_unc, "slab_uncertainty"),
+                uncertainty_ads=_scalar_to_float(ads_unc, "ads_uncertainty"),
+                uncertainty_rep=_scalar_to_float(rep_unc, "rep_uncertainty"),
+            )
+
+        slab_energy, total_energy, ads_energy, rep_energy = self.calculator(atoms)
+        return EnergyComponents(
+            total=_scalar_to_float(total_energy, "total_energy"),
+            slab=_scalar_to_float(slab_energy, "slab_energy"),
+            ads=_scalar_to_float(ads_energy, "ads_energy"),
+            rep=_scalar_to_float(rep_energy, "rep_energy"),
+            uncertainty=float("nan"),
+            uncertainty_slab=float("nan"),
+            uncertainty_ads=float("nan"),
+            uncertainty_rep=float("nan"),
+        )
+
+
 def _fmt_table_float(value: float, width: int = 12, precision: int = 5, scientific: bool = False) -> str:
     value = float(value)
     if np.isnan(value):
@@ -1374,7 +1510,7 @@ def main() -> None:
     else:
         print("Initial CO occupation: N_CO = 0", flush=True)
 
-    evaluator = LocalDescriptorEnergyEvaluator(
+    evaluator = CalculatorEnergyEvaluator(
         file_slab_model=args.slab_model,
         file_ads_model=args.ads_model,
         file_rep_model=args.rep_model,
@@ -1385,14 +1521,20 @@ def main() -> None:
         local_cutoff_margin=args.local_cutoff_margin,
     )
     cutoffs = evaluator.cutoffs()
-    rep_cutoff_text = "lazy/not loaded" if not np.isfinite(cutoffs["rep"]) else f"{cutoffs['rep']:.6f} A"
-    print(
-        "effective local descriptor invalidation cutoffs: "
-        f"slab={cutoffs['slab']:.6f} A, "
-        f"ads={cutoffs['ads']:.6f} A, "
-        f"rep={rep_cutoff_text}",
-        flush=True,
-    )
+    if not any(np.isfinite(value) for value in cutoffs.values()):
+        print(
+            "energy evaluation mode: CalculatorCESparseGPR full-structure descriptor rebuild",
+            flush=True,
+        )
+    else:
+        rep_cutoff_text = "lazy/not loaded" if not np.isfinite(cutoffs["rep"]) else f"{cutoffs['rep']:.6f} A"
+        print(
+            "effective local descriptor invalidation cutoffs: "
+            f"slab={cutoffs['slab']:.6f} A, "
+            f"ads={cutoffs['ads']:.6f} A, "
+            f"rep={rep_cutoff_text}",
+            flush=True,
+        )
 
     mc = GrandCO_MC(
         slab_atoms=slab_atoms,

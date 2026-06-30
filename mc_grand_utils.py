@@ -15,12 +15,6 @@ KB_EV = 8.617333262145e-5  # eV/K
 
 @dataclass(frozen=True)
 class AdsorptionSite:
-    """One lattice-gas CO adsorption site.
-
-    position is the carbon position of an upright CO molecule.
-    atom_indices are substrate atoms defining the site:
-    one atom for ontop, two atoms for bridge.
-    """
 
     position: np.ndarray
     kind: str
@@ -160,6 +154,84 @@ def validate_sites(sites: Sequence[AdsorptionSite], n_atoms: int | None = None) 
     return sites
 
 
+def assign_substrate_layers(atoms: Atoms, z_tol: float = 0.1) -> np.ndarray:
+
+    z_tol = nonnegative_float(z_tol, "z_tol")
+    if len(atoms) == 0:
+        raise ValueError("Cannot assign layers for an empty structure.")
+
+    positions = atoms.get_positions()
+    if positions.shape != (len(atoms), 3) or not np.isfinite(positions).all():
+        raise ValueError("atoms positions must be finite and have shape (n_atoms, 3).")
+
+    z = np.asarray(positions[:, 2], dtype=np.float64)
+    order = np.argsort(z)
+    layer_ids = np.empty(len(atoms), dtype=int)
+
+    current_layer = -1
+    current_values: list[float] = []
+    current_mean = None
+
+    for idx in order:
+        zi = float(z[int(idx)])
+        if current_mean is None or abs(zi - current_mean) > z_tol:
+            current_layer += 1
+            current_values = [zi]
+            current_mean = zi
+        else:
+            current_values.append(zi)
+            current_mean = float(np.mean(current_values))
+        layer_ids[int(idx)] = current_layer
+
+    return layer_ids
+
+
+def layer_summary(atoms: Atoms, layer_ids: np.ndarray) -> list[dict[str, float | int]]:
+
+    layer_ids = np.asarray(layer_ids, dtype=int)
+    if layer_ids.shape != (len(atoms),):
+        raise ValueError(f"layer_ids must have shape ({len(atoms)},), got {layer_ids.shape}.")
+    if len(layer_ids) == 0:
+        return []
+    if np.any(layer_ids < 0):
+        raise ValueError("layer_ids must be non-negative for substrate atoms.")
+
+    z = atoms.get_positions()[:, 2]
+    summary: list[dict[str, float | int]] = []
+    for layer in sorted(set(int(x) for x in layer_ids)):
+        mask = layer_ids == layer
+        z_layer = z[mask]
+        summary.append(
+            {
+                "layer": int(layer),
+                "n_atoms": int(mask.sum()),
+                "z_mean": float(np.mean(z_layer)),
+                "z_min": float(np.min(z_layer)),
+                "z_max": float(np.max(z_layer)),
+            }
+        )
+    return summary
+
+
+def frozen_atom_mask_from_layers(layer_ids: np.ndarray, frozen_layers: Iterable[int]) -> np.ndarray:
+
+    layer_ids = np.asarray(layer_ids, dtype=int)
+    frozen = {int(layer) for layer in frozen_layers}
+    if any(layer < 0 for layer in frozen):
+        raise ValueError(f"Frozen layer ids must be non-negative, got {sorted(frozen)}.")
+    if len(layer_ids) == 0:
+        raise ValueError("layer_ids must not be empty.")
+
+    n_layers = int(layer_ids.max()) + 1
+    invalid = sorted(layer for layer in frozen if layer >= n_layers)
+    if invalid:
+        raise ValueError(
+            f"Frozen layer id(s) {invalid} are out of range. "
+            f"Available layer ids are 0..{n_layers - 1}."
+        )
+    return np.isin(layer_ids, np.array(sorted(frozen), dtype=int))
+
+
 def build_supercell(
     structure: str,
     lattice_constant: float,
@@ -167,7 +239,7 @@ def build_supercell(
     supercell: np.ndarray,
     seed: int | None = None,
 ) -> Atoms:
-    """Build a random alloy supercell with a fixed integer composition."""
+
     if not composition:
         raise ValueError("composition must not be empty.")
 
@@ -215,7 +287,7 @@ def build_supercell(
 
 
 def strip_to_symbols(atoms: Atoms, keep_symbols: Iterable[str] = ("Pt", "Pd")) -> Atoms:
-    """Return only substrate atoms, removing adsorbates from an input structure."""
+
     keep = {str(symbol) for symbol in keep_symbols}
     if not keep:
         raise ValueError("keep_symbols must not be empty.")
@@ -229,7 +301,7 @@ def strip_to_symbols(atoms: Atoms, keep_symbols: Iterable[str] = ("Pt", "Pd")) -
 
 
 def mic_distance(pos_i, pos_j, cell, pbc) -> float:
-    """Full 3D minimum-image distance with the supplied PBC mask."""
+
     pos_i = np.asarray(pos_i, dtype=np.float64)
     pos_j = np.asarray(pos_j, dtype=np.float64)
     if pos_i.shape != (3,) or pos_j.shape != (3,):
@@ -240,7 +312,7 @@ def mic_distance(pos_i, pos_j, cell, pbc) -> float:
 
 
 def pbc_xy_distance(pos_i, pos_j, cell, pbc) -> float:
-    """Minimum-image distance projected onto xy."""
+
     pos_i = np.asarray(pos_i, dtype=np.float64)
     pos_j = np.asarray(pos_j, dtype=np.float64)
     if pos_i.shape != (3,) or pos_j.shape != (3,):
@@ -297,7 +369,7 @@ def find_adsorption_sites(
     include_ontop: bool = True,
     include_bridge: bool = True,
 ) -> list[AdsorptionSite]:
-    """Find ontop and bridge adsorption sites on the top substrate layer."""
+
     height = positive_float(height, "height")
     z_atol = nonnegative_float(z_atol, "z_atol")
     bridge_cutoff_factor = positive_float(bridge_cutoff_factor, "bridge_cutoff_factor")
@@ -364,7 +436,7 @@ def build_adsorbed_structure(
     occupation: np.ndarray,
     co_bond: float = 1.15,
 ) -> Atoms:
-    """Create slab + upright CO molecules from a fixed site-occupation vector."""
+
     sites = validate_sites(sites, n_atoms=len(slab_atoms))
     occupation = validate_occupation(occupation, len(sites))
     co_bond = positive_float(co_bond, "co_bond")
@@ -382,7 +454,7 @@ def build_adsorbed_structure(
 
 
 def carbon_index_by_site_id(n_slab_atoms: int, occupation: np.ndarray) -> dict[int, int]:
-    """Map occupied site_id -> carbon atom index in build_adsorbed_structure output."""
+
     occupation = np.asarray(occupation, dtype=bool)
     mapping: dict[int, int] = {}
     n_slab_atoms = int(n_slab_atoms)
@@ -401,7 +473,7 @@ def min_distance_to_occupied_sites(
     cell,
     pbc,
 ) -> float:
-    """Return minimum C-C xy distance from a trial site to already occupied sites."""
+
     sites = validate_sites(sites)
     occupation = validate_occupation(occupation, len(sites))
     trial_site_id = int(trial_site_id)
@@ -429,7 +501,7 @@ def occupation_satisfies_min_distance(
     cell,
     pbc,
 ) -> bool:
-    """Check pairwise occupied-site C-C xy distances."""
+
     min_distance = nonnegative_float(min_distance, "min_distance")
     if min_distance <= 0.0:
         return True
@@ -450,7 +522,7 @@ def metropolis_hastings_accept(
     log_q_reverse_over_forward: float,
     rng: np.random.Generator,
 ) -> bool:
-    """Accept with min(1, exp(-beta*dOmega) * q_reverse/q_forward)."""
+
     delta_omega = finite_float(delta_omega, "delta_omega")
     beta = positive_float(beta, "beta")
     log_q_reverse_over_forward = finite_float(log_q_reverse_over_forward, "log_q_reverse_over_forward")
@@ -464,19 +536,27 @@ def propose_pt_pd_swap(
     slab_atoms: Atoms,
     rng: np.random.Generator,
     allowed_symbols: tuple[str, str] = ("Pt", "Pd"),
+    allowed_indices: Iterable[int] | None = None,
 ) -> tuple[Atoms | None, tuple[int, int] | None]:
-    """Swap two substrate atoms of different species.
 
-    Returns (None, None) if the structure is pure Pt or pure Pd; the caller can
-    treat this as a skipped/rejected alloy move instead of crashing the MC run.
-    """
     if len(allowed_symbols) != 2:
         raise ValueError("allowed_symbols must contain exactly two symbols.")
 
     symbols = np.asarray(slab_atoms.get_chemical_symbols())
     species0, species1 = allowed_symbols
-    idx0 = np.where(symbols == species0)[0]
-    idx1 = np.where(symbols == species1)[0]
+
+    if allowed_indices is None:
+        mobile_mask = np.ones(len(slab_atoms), dtype=bool)
+    else:
+        allowed_indices_arr = np.asarray(list(allowed_indices), dtype=int).ravel()
+        mobile_mask = np.zeros(len(slab_atoms), dtype=bool)
+        if allowed_indices_arr.size > 0:
+            if np.any(allowed_indices_arr < 0) or np.any(allowed_indices_arr >= len(slab_atoms)):
+                raise IndexError("allowed_indices contains atom index out of range.")
+            mobile_mask[allowed_indices_arr] = True
+
+    idx0 = np.where((symbols == species0) & mobile_mask)[0]
+    idx1 = np.where((symbols == species1) & mobile_mask)[0]
     if len(idx0) == 0 or len(idx1) == 0:
         return None, None
 
@@ -494,8 +574,10 @@ def attach_mc_info(
     energy: EnergyComponents,
     occupation: np.ndarray,
     av_comp: np.ndarray | None = None,
+    layer_ids: np.ndarray | None = None,
+    frozen_atom_mask: np.ndarray | None = None,
 ) -> Atoms:
-    """Attach scalar MC metadata and optional composition averages."""
+
     atoms = atoms.copy()
     occupation = np.asarray(occupation, dtype=bool)
     n_co = int(occupation.sum())
@@ -515,9 +597,31 @@ def attach_mc_info(
     is_adsorbate = np.array([1.0 if atom.symbol in {"C", "O"} else 0.0 for atom in atoms], dtype=np.float64)
     atoms.set_array("is_adsorbate", is_adsorbate)
 
+    n_substrate = len(atoms) - 2 * n_co
+
+    if layer_ids is not None:
+        layer_ids = np.asarray(layer_ids, dtype=int)
+        if len(layer_ids) != n_substrate:
+            raise ValueError(
+                f"layer_ids must have length {n_substrate} for substrate atoms, got {len(layer_ids)}."
+            )
+        layer_full = np.full(len(atoms), -1, dtype=int)
+        layer_full[:n_substrate] = layer_ids
+        atoms.set_array("layer_id", layer_full)
+
+    if frozen_atom_mask is not None:
+        frozen_atom_mask = np.asarray(frozen_atom_mask, dtype=bool)
+        if len(frozen_atom_mask) != n_substrate:
+            raise ValueError(
+                f"frozen_atom_mask must have length {n_substrate} for substrate atoms, "
+                f"got {len(frozen_atom_mask)}."
+            )
+        frozen_full = np.zeros(len(atoms), dtype=np.float64)
+        frozen_full[:n_substrate] = frozen_atom_mask.astype(np.float64)
+        atoms.set_array("is_frozen_layer", frozen_full)
+
     if av_comp is not None:
         av_comp = np.asarray(av_comp, dtype=np.float64)
-        n_substrate = len(atoms) - 2 * n_co
         if len(av_comp) != n_substrate:
             raise ValueError(
                 f"av_comp must have length {n_substrate} for substrate atoms, got {len(av_comp)}."

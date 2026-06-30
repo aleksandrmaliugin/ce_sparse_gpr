@@ -13,32 +13,32 @@ import torch
 from ase.io import read, write
 from ase.io.trajectory import Trajectory
 
-
-
-try:
-    from mc_grand_utils import (
-        KB_EV,
-        AdsorptionSite,
-        EnergyComponents,
-        MCStats,
-        attach_mc_info,
-        build_adsorbed_structure,
-        build_supercell,
-        carbon_index_by_site_id,
-        find_adsorption_sites,
-        finite_float,
-        mic_distance,
-        min_distance_to_occupied_sites,
-        pbc_xy_distance,
-        metropolis_hastings_accept,
-        nonnegative_float,
-        occupation_satisfies_min_distance,
-        positive_float,
-        propose_pt_pd_swap,
-        strip_to_symbols,
-        validate_occupation,
-        validate_sites,
-    )
+from mc_grand_utils import (
+    KB_EV,
+    AdsorptionSite,
+    EnergyComponents,
+    MCStats,
+    attach_mc_info,
+    build_adsorbed_structure,
+    build_supercell,
+    carbon_index_by_site_id,
+    find_adsorption_sites,
+    finite_float,
+    mic_distance,
+    min_distance_to_occupied_sites,
+    pbc_xy_distance,
+    metropolis_hastings_accept,
+    nonnegative_float,
+    occupation_satisfies_min_distance,
+    positive_float,
+    propose_pt_pd_swap,
+    strip_to_symbols,
+    validate_occupation,
+    validate_sites,
+    assign_substrate_layers,
+    frozen_atom_mask_from_layers,
+    layer_summary,
+)
 
 from ce_sparse_gpr.ce_extractor import ClusterExpansion
 from ce_sparse_gpr.gpr import SparseAtomicGPR
@@ -46,12 +46,6 @@ from ce_sparse_gpr.gpr import SparseAtomicGPR
 
 @dataclass
 class LocalMCState:
-    """MC state with cached descriptor kernel rows.
-
-    slab_k maps substrate atom index -> k(x_i, X_M) for the slab model.
-    ads_k maps occupied adsorption site id -> k(x_site, X_M) for the adsorption model.
-    rep_k maps occupied adsorption site id -> k(x_C, X_M) for the CO-CO repulsion model.
-    """
 
     slab_atoms: object
     occupation: np.ndarray
@@ -62,12 +56,6 @@ class LocalMCState:
 
     def __post_init__(self) -> None:
         self.occupation = np.asarray(self.occupation, dtype=bool).copy()
-
-
-# -----------------------------------------------------------------------------
-# CLI and validation
-# -----------------------------------------------------------------------------
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -139,6 +127,35 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--z-atol", type=float, default=1e-3)
     parser.add_argument("--bridge-cutoff-factor", type=float, default=1.25)
+    parser.add_argument(
+        "--layer-z-tol",
+        type=float,
+        default=0.1,
+        help=(
+            "Tolerance in angstrom for grouping substrate atoms into z-layers. "
+            "Layer ids are numbered from 0 at the bottom of the slab."
+        ),
+    )
+    parser.add_argument(
+        "--freeze-layers",
+        type=int,
+        nargs="*",
+        default=(),
+        help=(
+            "Substrate layer ids to freeze during Pt/Pd swap MC. "
+            "Layer numbering starts from 0 at the bottom of the slab, e.g. "
+            "--freeze-layers 0 1 freezes the two bottom layers."
+        ),
+    )
+    parser.add_argument(
+        "--freeze-bottom-layers",
+        type=int,
+        default=0,
+        help=(
+            "Convenience option: freeze this many bottom substrate layers. "
+            "For example, --freeze-bottom-layers 2 is equivalent to --freeze-layers 0 1."
+        ),
+    )
 
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--device", default="cpu")
@@ -183,9 +200,14 @@ def validate_args(args: argparse.Namespace) -> None:
     positive_float(args.co_bond, "co_bond")
     nonnegative_float(args.min_co_distance, "min_co_distance")
     nonnegative_float(args.z_atol, "z_atol")
+    nonnegative_float(args.layer_z_tol, "layer_z_tol")
     nonnegative_float(args.initial_site_match_tol, "initial_site_match_tol")
     positive_float(args.bridge_cutoff_factor, "bridge_cutoff_factor")
     nonnegative_float(args.local_cutoff_margin, "local_cutoff_margin")
+    if int(args.freeze_bottom_layers) < 0:
+        raise ValueError(f"freeze_bottom_layers must be non-negative, got {args.freeze_bottom_layers}.")
+    if any(int(layer) < 0 for layer in args.freeze_layers):
+        raise ValueError(f"freeze_layers must contain non-negative layer ids, got {args.freeze_layers}.")
 
     if args.active_learning:
         if args.active_learning_trajectory in (None, ""):
@@ -209,13 +231,7 @@ def _safe_set_torch_threads(n_threads: int = 1) -> None:
 
 
 def load_or_build_slab(args: argparse.Namespace):
-    """Return substrate-only atoms and, if present, the original input atoms.
 
-    The MC state is represented by a clean Pt/Pd slab plus a Boolean occupation
-    vector.  Therefore C/O atoms are stripped from the structure used as the
-    slab, but the original input structure is kept so that pre-existing C atoms
-    can be mapped onto the MC site grid as the initial occupation.
-    """
     input_atoms = None
 
     if args.cell is not None:
@@ -252,12 +268,7 @@ def initial_occupation_from_input_adsorbates(
     min_co_distance: float,
     ignore_cell_adsorbates: bool = False,
 ) -> np.ndarray:
-    """Map C atoms already present in the input structure onto MC site ids.
 
-    This does not reintroduce random initial coverage.  It only preserves the
-    physical CO occupation encoded in --cell/POSCAR.  The slab itself remains
-    substrate-only; MC structures are rebuilt from the site occupation vector.
-    """
     sites = validate_sites(sites, n_atoms=len(slab_atoms))
     occupation = np.zeros(len(sites), dtype=bool)
 
@@ -333,9 +344,34 @@ def initial_occupation_from_input_adsorbates(
 
     return occupation
 
-# -----------------------------------------------------------------------------
-# Local descriptor-cache evaluator
-# -----------------------------------------------------------------------------
+
+def frozen_layers_from_args(args: argparse.Namespace, n_layers: int) -> set[int]:
+
+    frozen = {int(layer) for layer in args.freeze_layers}
+    frozen.update(range(int(args.freeze_bottom_layers)))
+    if any(layer < 0 for layer in frozen):
+        raise ValueError(f"Frozen layer ids must be non-negative, got {sorted(frozen)}.")
+    invalid = sorted(layer for layer in frozen if layer >= int(n_layers))
+    if invalid:
+        raise ValueError(
+            f"Frozen layer id(s) {invalid} are out of range. "
+            f"Available layer ids are 0..{int(n_layers) - 1}."
+        )
+    return frozen
+
+
+def print_layer_report(slab_atoms, layer_ids: np.ndarray, frozen_layers: set[int]) -> None:
+    print("Substrate layers are numbered from bottom to top, starting at 0:", flush=True)
+    for item in layer_summary(slab_atoms, layer_ids):
+        layer = int(item["layer"])
+        tag = "frozen" if layer in frozen_layers else "mobile"
+        print(
+            f"  layer {layer:2d}: n_atoms={int(item['n_atoms']):4d}, "
+            f"z_mean={float(item['z_mean']):10.5f} A, "
+            f"z_range=[{float(item['z_min']):.5f}, {float(item['z_max']):.5f}] A, "
+            f"{tag}",
+            flush=True,
+        )
 
 
 def cutoff_from_shells_dict(config, margin: float = 0.05) -> float:
@@ -371,12 +407,6 @@ def _load_sparse_model(model_path: str, device: str, allow_unsafe_load: bool) ->
 
 
 class LocalDescriptorEnergyEvaluator:
-    """Energy evaluator based on cached local descriptor kernel rows.
-
-    It intentionally bypasses the ASE-style calculator during MC.  For each
-    model, the structure kernel vector is a sum of row kernels, so a trial move
-    only needs to update rows whose local environment changed.
-    """
 
     def __init__(
         self,
@@ -398,10 +428,6 @@ class LocalDescriptorEnergyEvaluator:
         self.slab_model = _load_sparse_model(file_slab_model, device, allow_unsafe_load)
         self.ads_model = _load_sparse_model(file_ads_model, device, allow_unsafe_load)
 
-        # The repulsion model is intentionally lazy. For N_CO = 0 or 1 the
-        # CO-CO term is exactly zero, so we must not load, validate, or evaluate
-        # rep_model. This also allows active-learning runs to start from a clean
-        # POSCAR without adsorbates.
         self.file_rep_model = file_rep_model
         self.rep_model: SparseAtomicGPR | None = None
         self.rep_extractor: ClusterExpansion | None = None
@@ -416,16 +442,7 @@ class LocalDescriptorEnergyEvaluator:
         self._validate_model_elements()
 
     def _validate_model_elements(self) -> None:
-        """Validate model element sets for the local-descriptor decomposition.
 
-        The adsorption model is evaluated on descriptors centered on the
-        substrate atoms that define an occupied site.  Therefore an ads model
-        trained with elements=(Pt, Pd) is valid: C/O are present in the trial
-        structure, but they are not required to be descriptor species unless the
-        model was explicitly trained that way.
-
-        The repulsion model is loaded and validated lazily only when N_CO > 1.
-        """
         slab_elements = set(self.slab_model.config.elements)
         ads_elements = set(self.ads_model.config.elements)
 
@@ -596,7 +613,6 @@ class LocalDescriptorEnergyEvaluator:
             rep_k=rep_k,
         )
 
-    # ----- row construction -----
 
     def _descriptor_k_rows(self, model: SparseAtomicGPR, descriptor) -> torch.Tensor:
         x = torch.as_tensor(descriptor, dtype=torch.float64, device=model.x_M.device)
@@ -613,7 +629,7 @@ class LocalDescriptorEnergyEvaluator:
         return model.rbf_kernel(x, model.x_M).detach()
 
     def _slab_k_rows(self, slab_atoms, atom_indices: Iterable[int]) -> dict[int, torch.Tensor]:
-        """Build slab kernel rows for several centers in one extractor call."""
+
         atom_indices = [int(i) for i in atom_indices]
         if not atom_indices:
             return {}
@@ -632,13 +648,7 @@ class LocalDescriptorEnergyEvaluator:
         return rows[int(atom_index)]
 
     def _ads_k_rows(self, atoms, site_ids: Iterable[int]) -> dict[int, torch.Tensor]:
-        """Build adsorption-site kernel rows for several sites in one extractor call.
 
-        Each site descriptor is a sum of metal-centered descriptor rows.  For
-        bridge sites this is the sum over the two metal atoms defining the site.
-        The extractor is called once for the union of all required metal atoms,
-        then rows are reused for all requested sites.
-        """
         site_ids = [int(site_id) for site_id in site_ids]
         if not site_ids:
             return {}
@@ -687,7 +697,7 @@ class LocalDescriptorEnergyEvaluator:
         return {site_id: k_rows[pos] for pos, site_id in enumerate(valid_site_ids)}
 
     def _ads_site_descriptor(self, atoms, site_id: int):
-        """Compatibility helper returning one summed site descriptor."""
+
         site = self.sites[int(site_id)]
         desc = self.ads_extractor(atoms, atom_indices=list(site.atom_indices))
         desc_t = torch.as_tensor(desc, dtype=torch.float64, device=self.ads_model.x_M.device)
@@ -711,7 +721,7 @@ class LocalDescriptorEnergyEvaluator:
         occupation: np.ndarray,
         site_ids: Iterable[int],
     ) -> dict[int, torch.Tensor]:
-        """Build CO-CO repulsion kernel rows for several occupied sites at once."""
+
         site_ids = [int(site_id) for site_id in site_ids]
         if not site_ids:
             return {}
@@ -754,11 +764,8 @@ class LocalDescriptorEnergyEvaluator:
         if int(occupation.sum()) <= 1:
             return {}
         occupied_site_ids = np.where(occupation)[0].astype(int)
-        # At N_CO > 1 every occupied CO has a carbon-centered repulsion row,
-        # including the molecule that was inserted first.
         return self._rep_k_rows(atoms, slab_atoms, occupation, occupied_site_ids)
 
-    # ----- affected-row logic -----
 
     def _affected_slab_centers(self, slab_atoms, changed_metal_indices: set[int]) -> set[int]:
         if not changed_metal_indices:
@@ -861,7 +868,6 @@ class LocalDescriptorEnergyEvaluator:
 
         return affected
 
-    # ----- energy and uncertainty from cached kernels -----
 
     @staticmethod
     def _sum_k(row_map: dict[int, torch.Tensor], model: SparseAtomicGPR) -> torch.Tensor:
@@ -877,7 +883,7 @@ class LocalDescriptorEnergyEvaluator:
 
     @staticmethod
     def _cached_K_MM_inv_K_NM_train_T(model: SparseAtomicGPR) -> torch.Tensor:
-        """Return K_MM^{-1} K_MN for uncertainty, cached per model."""
+
         cache_name = "_localdesc_K_MM_inv_K_NM_train_T"
         cached = getattr(model, cache_name, None)
         if cached is not None:
@@ -918,8 +924,6 @@ class LocalDescriptorEnergyEvaluator:
         slab_sum = self._sum_k(slab_k, self.slab_model)
         ads_sum = self._sum_k(ads_k, self.ads_model)
 
-        # Important: do not touch rep_model when there are no repulsion rows.
-        # For N_CO = 0 or 1, E_rep = 0 by definition in this decomposition.
         if rep_k:
             rep_model = self._require_rep_model()
             rep_sum = self._sum_k(rep_k, rep_model)
@@ -954,6 +958,7 @@ class LocalDescriptorEnergyEvaluator:
             uncertainty_ads=ads_u,
             uncertainty_rep=rep_u,
         )
+
 
 
 
@@ -1009,12 +1014,8 @@ def progress_table_row(step: int, state: LocalMCState, n_sites: int, stats: MCSt
         f"{_fmt_table_float(acc_mig, 8, 3)}"
     )
 
-# -----------------------------------------------------------------------------
-# MC driver
-# -----------------------------------------------------------------------------
 
-
-class SemiGrandCO_MC:
+class GrandCO_MC:
     def __init__(
         self,
         slab_atoms,
@@ -1029,6 +1030,9 @@ class SemiGrandCO_MC:
         uncertainty_threshold: float = float("inf"),
         active_learning_trajectory: str | None = None,
         initial_occupation: np.ndarray | None = None,
+        layer_ids: np.ndarray | None = None,
+        frozen_atom_mask: np.ndarray | None = None,
+        frozen_layers: set[int] | None = None,
     ):
         self.sites = validate_sites(list(sites), n_atoms=len(slab_atoms))
         if len(self.sites) == 0:
@@ -1048,6 +1052,29 @@ class SemiGrandCO_MC:
         self.active_learning_count = 0
 
         self.slab_atoms = slab_atoms.copy()
+
+        if layer_ids is None:
+            self.layer_ids = None
+        else:
+            self.layer_ids = np.asarray(layer_ids, dtype=int).copy()
+            if self.layer_ids.shape != (len(self.slab_atoms),):
+                raise ValueError(
+                    f"layer_ids must have shape ({len(self.slab_atoms)},), got {self.layer_ids.shape}."
+                )
+
+        if frozen_atom_mask is None:
+            self.frozen_atom_mask = np.zeros(len(self.slab_atoms), dtype=bool)
+        else:
+            self.frozen_atom_mask = np.asarray(frozen_atom_mask, dtype=bool).copy()
+            if self.frozen_atom_mask.shape != (len(self.slab_atoms),):
+                raise ValueError(
+                    f"frozen_atom_mask must have shape ({len(self.slab_atoms)},), "
+                    f"got {self.frozen_atom_mask.shape}."
+                )
+
+        self.mobile_atom_indices = np.where(~self.frozen_atom_mask)[0].astype(int)
+        self.frozen_layers = set() if frozen_layers is None else {int(x) for x in frozen_layers}
+
         self.stats = MCStats()
         self.av_pd_sum = np.zeros(len(self.slab_atoms), dtype=np.float64)
         self.av_comp_count = 0
@@ -1092,6 +1119,8 @@ class SemiGrandCO_MC:
             energy=state.energy,
             occupation=state.occupation,
             av_comp=None,
+            layer_ids=self.layer_ids,
+            frozen_atom_mask=self.frozen_atom_mask,
         )
         atoms_out.info["active_learning_uncertainty"] = uncertainty
         atoms_out.info["active_learning_uncertainty_slab"] = float(getattr(state.energy, "uncertainty_slab", float("nan")))
@@ -1109,7 +1138,11 @@ class SemiGrandCO_MC:
 
     def attempt_alloy_swap(self, state: LocalMCState) -> LocalMCState:
         self.stats.alloy_attempts += 1
-        candidate_slab, pair = propose_pt_pd_swap(state.slab_atoms, rng=self.rng)
+        candidate_slab, pair = propose_pt_pd_swap(
+            state.slab_atoms,
+            rng=self.rng,
+            allowed_indices=self.mobile_atom_indices,
+        )
         if candidate_slab is None or pair is None:
             return state
 
@@ -1130,15 +1163,13 @@ class SemiGrandCO_MC:
         return state
 
     def _select_co_event(self, occupation: np.ndarray, site_id: int) -> tuple[str, int | None, float, int]:
-        """Return (event, target_site, log_q_reverse/q_forward, delta_n)."""
+
         n_sites = len(occupation)
         old_occ = np.asarray(occupation, dtype=bool)
         old_value = bool(old_occ[site_id])
 
         if not old_value:
             n_free_old = int((~old_occ).sum())
-            # forward: choose empty site = 1/N
-            # reverse after insertion: choose same occupied site and deletion event = 1/N * 1/n_free_old
             return "insert", None, -np.log(float(n_free_old)), +1
 
         free_sites = np.where(~old_occ)[0].astype(int)
@@ -1147,12 +1178,9 @@ class SemiGrandCO_MC:
         event, target = events[int(self.rng.integers(len(events)))]
 
         if event == "delete":
-            # forward: choose occupied site and deletion among [delete, migrations]
-            # reverse: choose the now-empty site and insert = 1/N
             log_q = np.log(float(len(events)))
             return "delete", None, log_q, -1
 
-        # Migration has a symmetric reverse event with the same number of free sites.
         return "migrate", int(target), 0.0, 0
 
     def attempt_co_move(self, state: LocalMCState) -> LocalMCState:
@@ -1232,7 +1260,14 @@ class SemiGrandCO_MC:
 
     def current_atoms_with_info(self, state: LocalMCState, include_av_comp: bool = False):
         av_comp = self.get_av_comp() if include_av_comp else None
-        return attach_mc_info(self.make_atoms(state), energy=state.energy, occupation=state.occupation, av_comp=av_comp)
+        return attach_mc_info(
+            self.make_atoms(state),
+            energy=state.energy,
+            occupation=state.occupation,
+            av_comp=av_comp,
+            layer_ids=self.layer_ids,
+            frozen_atom_mask=self.frozen_atom_mask,
+        )
 
     def run(
         self,
@@ -1289,6 +1324,17 @@ def main() -> None:
         _ensure_parent_dir(args.active_learning_trajectory)
 
     slab_atoms, input_atoms = load_or_build_slab(args)
+
+    layer_ids = assign_substrate_layers(slab_atoms, z_tol=args.layer_z_tol)
+    n_layers = int(layer_ids.max()) + 1
+    frozen_layers = frozen_layers_from_args(args, n_layers=n_layers)
+    frozen_atom_mask = frozen_atom_mask_from_layers(layer_ids, frozen_layers)
+    print_layer_report(slab_atoms, layer_ids, frozen_layers)
+    print(
+        f"Frozen substrate atoms: {int(frozen_atom_mask.sum())}/{len(frozen_atom_mask)}",
+        flush=True,
+    )
+
     sites = find_adsorption_sites(
         slab_atoms,
         height=args.co_height,
@@ -1341,7 +1387,7 @@ def main() -> None:
         flush=True,
     )
 
-    mc = SemiGrandCO_MC(
+    mc = GrandCO_MC(
         slab_atoms=slab_atoms,
         sites=sites,
         evaluator=evaluator,
@@ -1353,6 +1399,9 @@ def main() -> None:
         uncertainty_threshold=args.uncertainty_threshold,
         active_learning_trajectory=args.active_learning_trajectory,
         initial_occupation=initial_occupation,
+        layer_ids=layer_ids,
+        frozen_atom_mask=frozen_atom_mask,
+        frozen_layers=frozen_layers,
     )
 
     state = mc.initial_state()

@@ -12,9 +12,10 @@ dependencies:
   - h5py
   - scikit-learn
   - pytorch
-  - linear-operator
   - ase
   - matplotlib
   - plotly
   - python-kaleido
   - tqdm
+  - pip:
+      - linear-operator

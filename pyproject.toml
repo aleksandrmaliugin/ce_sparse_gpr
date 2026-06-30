@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ce-sparse-gpr"
+version = "0.1.0"
+description = "Cluster-expansion descriptors with sparse Gaussian process regression"
+authors = [
+    { name = "Aleksandr Maliugin" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+    "scipy",
+    "pandas",
+    "scikit-learn",
+    "torch",
+    "ase",
+    "matplotlib",
+    "plotly>=5.20",
+    "kaleido",
+    "tqdm",
+    "h5py",
+    "linear-operator",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ce_sparse_gpr*"]

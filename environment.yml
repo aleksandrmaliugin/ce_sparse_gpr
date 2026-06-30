@@ -1,21 +1,20 @@
-name: ace_gpr
+name: ce_sparse_gpr
+
 channels:
   - conda-forge
-  - defaults
 
 dependencies:
   - python=3.12
   - pip
   - numpy
   - scipy
-  - matplotlib
   - pandas
-  - scikit-learn
-  - tqdm
   - h5py
-  - ase
+  - scikit-learn
   - pytorch
-  - pip:
-      - gpytorch
-      - linear-operator
-      - plotly
+  - linear-operator
+  - ase
+  - matplotlib
+  - plotly
+  - python-kaleido
+  - tqdm

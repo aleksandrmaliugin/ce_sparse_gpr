@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
 """Filter active-learning MC candidates by model-space diversity.
 
-The script reads structures written by the MC active-learning trajectory and
-keeps only candidates that are sufficiently different in the descriptor/kernel
-space of the loaded SparseAtomicGPR models.
-
-Typical use:
-
-python filter_active_learning_candidates_v1.py \
+python filter_active_learning_candidates_ce.py \
     --input active_learning_candidates.traj \
     --output active_learning_unique.traj \
     --slab-model slab_model.pt \
@@ -200,7 +194,6 @@ def l2_normalize(v: np.ndarray) -> np.ndarray:
 
 @torch.no_grad()
 def kernel_sum_feature(model: SparseAtomicGPR, x) -> np.ndarray:
-    """Return sum-row kernel feature K_NM for one structure/block."""
     if x is None:
         return np.zeros(int(model.x_M.shape[0]), dtype=np.float64)
 
@@ -222,7 +215,6 @@ def kernel_sum_feature(model: SparseAtomicGPR, x) -> np.ndarray:
 
 
 def atoms_near_carbon_top_bridge(atoms: Atoms):
-    """Call atoms_near_carbon while staying compatible with older dataset.py."""
     try:
         return atoms_near_carbon(atoms, allowed_site_types=("top", "bridge"))
     except TypeError:
@@ -238,7 +230,7 @@ def component_features(
     ads_extractor: ClusterExpansion,
     rep_extractor: ClusterExpansion | None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-    """Compute model-space features for slab, ads and rep blocks."""
+
     slab_desc = slab_extractor(atoms)
     slab_feat = kernel_sum_feature(slab_model, slab_desc)
 

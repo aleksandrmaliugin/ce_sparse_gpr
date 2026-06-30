@@ -247,7 +247,7 @@ def atoms_near_carbon(
     radius: float = 2.8,
     carbon_symbol: str = "C",
     oxygen_symbol: str = "O",
-    distance_tol: float = 0.3,
+    distance_tol: float = 0.5,
     allowed_site_types: tuple[str, ...] | None = ("top", "bridge", "hollow"),
 ):
     """

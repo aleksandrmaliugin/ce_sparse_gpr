@@ -13,32 +13,10 @@ import torch
 from ase.io import read, write
 from ase.io.trajectory import Trajectory
 
+
+
 try:
-    from mc_grand_localdesc_v3_5_utils import (
-        KB_EV,
-        AdsorptionSite,
-        EnergyComponents,
-        MCStats,
-        attach_mc_info,
-        build_adsorbed_structure,
-        build_supercell,
-        carbon_index_by_site_id,
-        find_adsorption_sites,
-        finite_float,
-        mic_distance,
-        min_distance_to_occupied_sites,
-        pbc_xy_distance,
-        metropolis_hastings_accept,
-        nonnegative_float,
-        occupation_satisfies_min_distance,
-        positive_float,
-        propose_pt_pd_swap,
-        strip_to_symbols,
-        validate_occupation,
-        validate_sites,
-    )
-except ImportError:  # pragma: no cover
-    from .mc_grand_localdesc_v3_5_utils import (
+    from mc_grand_utils import (
         KB_EV,
         AdsorptionSite,
         EnergyComponents,

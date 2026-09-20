@@ -7,6 +7,7 @@ import ase
 import numpy as np
 import torch
 from ase.neighborlist import neighbor_list
+from scipy.linalg import qr
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
@@ -147,12 +148,20 @@ class CEDataset(Dataset):
             raise ValueError("Descriptor mask removes all descriptors.")
 
         n_total = int(mask.size)
+        n_nonzero = int(mask.sum())
+
+        kept_idx = np.where(mask)[0]
+        _, _, dependent_local = _rank_pivoted_columns(X_all[:, kept_idx])
+        dependent_idx = kept_idx[dependent_local]
+
+        mask = mask.copy()
+        mask[dependent_idx] = False
         n_kept = int(mask.sum())
-        n_removed = n_total - n_kept
 
         print(
-            f"Descriptor mask fitted: kept {n_kept}/{n_total} features, "
-            f"removed {n_removed} always-zero features."
+            f"Descriptor mask fitted: kept {n_kept}/{n_total} features "
+            f"(removed {n_total - n_nonzero} always-zero, "
+            f"{len(dependent_idx)} linearly-dependent)."
         )
 
         return mask
@@ -351,3 +360,106 @@ def calc_mindist(atoms: ase.Atoms) -> float:
         raise ValueError("Could not compute a finite minimum distance.")
 
     return mindist
+
+
+def _stack_descriptor_rows(x_list) -> np.ndarray:
+    rows = []
+    for x in x_list:
+        rows.append(x.detach().cpu().numpy() if torch.is_tensor(x) else np.asarray(x))
+    return np.concatenate(rows, axis=0)
+
+
+def _rank_pivoted_columns(X: np.ndarray, rtol: float = 1e-8) -> tuple[int, np.ndarray, np.ndarray]:
+    """Column-pivoted QR (scipy.linalg.qr(..., pivoting=True)): the first
+    `rank` pivoted columns form a well-conditioned basis, the remaining
+    columns are (to within rtol) exact linear combinations of that basis -
+    this identifies *which* columns are redundant, not just that some are
+    (plain SVD/np.linalg.matrix_rank only gives the rank number).
+
+    Returns (rank, independent_local_idx, dependent_local_idx), indices into
+    X's own columns (sorted ascending within each group).
+    """
+    singular_values = np.linalg.svd(X, compute_uv=False)
+    tol = rtol * singular_values.max()
+    rank = int((singular_values > tol).sum())
+
+    _, _, pivot = qr(X, mode="economic", pivoting=True)
+    independent_idx = np.sort(pivot[:rank])
+    dependent_idx = np.sort(pivot[rank:])
+
+    return rank, independent_idx, dependent_idx
+
+
+def find_linearly_dependent_descriptors(
+    train_x,
+    names: list[str],
+    rtol: float = 1e-8,
+    verbose: bool = True,
+) -> dict:
+    """Check a descriptor matrix for exact linear dependence between columns
+    - run this on train_x/dataset.extractor.descriptor_names to see what a
+    fitted CEDataset's own descriptor_mask already pruned (build_dataset
+    calls this same rank check internally - see _make_nonzero_descriptor_mask),
+    or on a dataset built with fit_descriptor_mask=False to see it before
+    any masking at all.
+
+    Why this matters: SparseAtomicGPR gives every descriptor dimension its
+    own ARD lengthscale and repeatedly factors kernel matrices (K_MM, A)
+    built from these dimensions. A column that is an exact linear
+    combination of others (not just "correlated" - literally reconstructible
+    to machine precision) contributes zero real information but still costs
+    a free hyperparameter and, more importantly, turns the kernel matrices
+    singular along that combination - inflating their condition number by
+    orders of magnitude and making Cholesky/gradient computations amplify
+    ordinary float64 rounding error. This was root-caused for the rep
+    pipeline (ce_gpr_train.rep.example.json): 22 of its 54 kept descriptor
+    columns turned out to be exact linear combinations of the other 32 (rank
+    32/54), inflating K_MM's condition number to ~6e6 - a direct product of
+    a fixed/standardized lattice geometry (same site positions in every
+    structure, only Pt/Pd occupancy differs) plus a shell list with far more,
+    finer bins than there are physically distinct local environments.
+
+    Parameters
+    ----------
+    train_x : list of 2D arrays/tensors, one per structure (as returned by
+        CEDataset.get_all() / dataset.X).
+    names : descriptor column names matching train_x's columns, e.g.
+        dataset.extractor.descriptor_names.
+    rtol : relative tolerance (fraction of the largest singular value) below
+        which a singular value is treated as numerically zero.
+
+    Returns
+    -------
+    dict with keys: "rank", "n_features", "independent_names",
+    "dependent_names", "independent_idx", "dependent_idx".
+    """
+    X = _stack_descriptor_rows(train_x)
+
+    if len(names) != X.shape[1]:
+        raise ValueError(
+            f"names has {len(names)} entries, but the descriptor matrix has "
+            f"{X.shape[1]} columns."
+        )
+
+    rank, independent_idx, dependent_idx = _rank_pivoted_columns(X, rtol=rtol)
+    independent_names = [names[i] for i in independent_idx]
+    dependent_names = [names[i] for i in dependent_idx]
+
+    if verbose:
+        print(
+            f"Linear dependence check: rank {rank}/{X.shape[1]} "
+            f"({len(dependent_names)} exact-linear-combination columns found)"
+        )
+        if dependent_names:
+            print("Dependent (redundant) columns:")
+            for n in dependent_names:
+                print(f"  {n}")
+
+    return {
+        "rank": rank,
+        "n_features": X.shape[1],
+        "independent_names": independent_names,
+        "dependent_names": dependent_names,
+        "independent_idx": independent_idx.tolist(),
+        "dependent_idx": dependent_idx.tolist(),
+    }

@@ -1,0 +1,55 @@
+{
+  "seed": 42,
+  "device": "cpu",
+  "dtype": "float64",
+
+  "dataset": {
+    "db_path": "datasets/al_test_slab.db",
+    "target_y": "dft_energy"
+  },
+
+  "test_dataset": {
+    "db_path": null,
+    "target_y": "dft_energy"
+  },
+
+  "descriptor": {
+    "elements": ["Pd", "Pt"],
+    "max_order": 2,
+    "mindist": 2.8179999999999996,
+    "shells": [0, 1.2, 1.6124515496597103, 1.8973665961010275, 2.1],
+    "atom_indices": null
+  },
+  "model": {
+    "M": 450,
+    "div": 0.1,
+    "init_lengthscale": "auto",
+    "init_sigma2": 0.0001,
+    "init_outputscale": 1.0,
+    "jitter": 1e-10,
+    "mean_function": "zero",
+    "warm_start": true
+  },
+
+  "training": {
+    "method": "kfold_lbfgs",
+    "best_model_metric": "rmse_valid",
+    "lbfgs": {
+      "n_steps": 30,
+      "max_iter": 20,
+      "lr": 0.1,
+      "loss_plateau_window": 5,
+      "loss_plateau_tol": 0.5
+    },
+    "kfold": {
+      "n_splits": 2,
+      "shuffle": true,
+      "seed": 42
+    }
+  },
+  "output": {
+    "dir": "runs/al_test_slab",
+    "model_filename": "model.pt",
+    "plot_filename": "accuracy.pdf"
+  }
+}

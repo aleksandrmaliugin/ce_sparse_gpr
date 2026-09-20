@@ -62,6 +62,40 @@ def rmse_metric_np(y_pred, y_true) -> float:
     return float(np.sqrt(np.mean((y_pred - y_true) ** 2)))
 
 
+def _per_co_residual(y_pred, y_true, n_co, name: str) -> np.ndarray:
+    """(pred-true)/n_co per structure - the building block for both
+    per-CO metrics below.
+
+    Why: on the unified ads+rep dataset, e_ads_total spans roughly -1.6 eV
+    (n_co=1) to -10 eV (n_co=8) - the SAME absolute error (say 0.3 eV) means
+    "clearly wrong" for one adsorbed CO but is unremarkable spread over 8, so
+    a plain whole-structure RMSE is implicitly dominated by the high-coverage
+    tail just because its errors live on a bigger absolute scale, not
+    because the model is actually worse there per molecule. Dividing each
+    structure's error by ITS OWN n_co before aggregating puts every adsorbed
+    CO on comparable footing regardless of how many share a structure."""
+    y_pred = _as_1d_numpy(y_pred, "y_pred")
+    y_true = _as_1d_numpy(y_true, "y_true")
+    n_co = _as_1d_numpy(n_co, "n_co")
+
+    if y_pred.shape != y_true.shape:
+        raise ValueError(f"{name}: prediction/target shape mismatch: {y_pred.shape} vs {y_true.shape}.")
+    if n_co.shape != y_pred.shape:
+        raise ValueError(f"{name}: n_co shape {n_co.shape} doesn't match y_pred shape {y_pred.shape}.")
+    if np.any(n_co <= 0):
+        raise ValueError(f"{name}: n_co must be positive (one adsorbed CO minimum).")
+
+    return (y_pred - y_true) / n_co
+
+
+def rmse_metric_np_per_co(y_pred, y_true, n_co) -> float:
+    return float(np.sqrt(np.mean(_per_co_residual(y_pred, y_true, n_co, "rmse_metric_np_per_co") ** 2)))
+
+
+def mae_metric_np_per_co(y_pred, y_true, n_co) -> float:
+    return float(np.mean(np.abs(_per_co_residual(y_pred, y_true, n_co, "mae_metric_np_per_co"))))
+
+
 def _add_prediction_trace(fig, name, y_pred, y_true, y_std, marker_size: int = 12):
     y_pred = _as_1d_numpy(y_pred, f"{name} y_pred")
     y_true = _as_1d_numpy(y_true, f"{name} y_true")
@@ -135,7 +169,7 @@ def plot_results(
     xy_max = float(np.max(xy_values))
 
     if xy_min == xy_max:
-        pad = max(1e-6, abs(xy_min) * 1e-3)
+        pad = max(1e-6, abs(xy_min) * 5e-2)
         xy_min -= pad
         xy_max += pad
 

@@ -2,18 +2,41 @@ from __future__ import annotations
 
 import argparse
 import inspect
+import json
 import os
+import subprocess
+import sys
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
 import numpy as np
 import torch
+from ase.geometry import get_distances
 from ase.io import read, write
-from ase.io.trajectory import Trajectory
 
-from mc_grand_calculator_utils import (
+
+def _find_repo_root(start: Path) -> Path:
+    """Walk upward from this file to the repo root (the folder holding
+    pyproject.toml next to the ce_sparse_gpr package). Needed only for
+    make_database.py, the one module ActiveLearningController imports that
+    lives at the repo root rather than inside the package.
+
+    Appended to sys.path (not inserted at the front) so this script's own
+    directory always wins name clashes against the repo root."""
+    for candidate in (start, *start.parents):
+        if (candidate / "pyproject.toml").exists() and (candidate / "ce_sparse_gpr").is_dir():
+            return candidate
+    return start
+
+
+_repo_root = str(_find_repo_root(Path(__file__).resolve().parent))
+if _repo_root not in sys.path:
+    sys.path.append(_repo_root)
+
+from ce_sparse_gpr import ce_gpr_train
+from ce_sparse_gpr.mc_grand_utils import (
     KB_EV,
     AdsorptionSite,
     EnergyComponents,
@@ -55,147 +78,97 @@ class LocalMCState:
     energy: EnergyComponents
     slab_k: dict[int, torch.Tensor]
     ads_k: dict[int, torch.Tensor]
-    rep_k: dict[int, torch.Tensor]
+    # Raw per-atom/per-site descriptor rows (NOT kernel-projected against
+    # x_M), cached alongside slab_k/ads_k with the same keys. Needed
+    # only to compute the exact self-kernel diagonal k(x*,x*) for
+    # uncertainty (see _mean_std_from_desc_and_k) - CalculatorEnergyEvaluator
+    # never populates these (defaults to {}) since it always has the full
+    # descriptor on hand and calls model.predict_uncertainty directly.
+    slab_desc: dict[int, torch.Tensor] = field(default_factory=dict)
+    ads_desc: dict[int, torch.Tensor] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.occupation = np.asarray(self.occupation, dtype=bool).copy()
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Serial Metropolis MC for Pt/Pd + semi-grand-canonical CO. "
-            "This version evaluates every trial structure through CalculatorCESparseGPR and reports theta_CO relative to the number of ontop sites."
-        )
-    )
+def load_config(path: str) -> dict:
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
 
-    parser.add_argument(
-        "--cell",
-        default=None,
-        help=(
-            "Input structure readable by ASE. If it contains C atoms, their xy positions "
-            "are mapped onto the generated ontop/bridge site grid and used as the initial CO occupation."
-        ),
-    )
-    parser.add_argument("--cell-format", default=None, help="Optional ASE input format.")
-    parser.add_argument(
-        "--ignore-cell-adsorbates",
-        action="store_true",
-        help="Strip C/O from --cell or POSCAR and start from an empty CO occupation.",
-    )
-    parser.add_argument(
-        "--initial-site-match-tol",
-        type=float,
-        default=0.35,
-        help="Maximum xy distance in angstrom for mapping C atoms from the input cell onto MC adsorption sites.",
-    )
-    parser.add_argument("--supercell", type=int, nargs=3, metavar=("Nx", "Ny", "Nz"), default=(4, 4, 6))
-    parser.add_argument("--lattice-constant", type=float, default=3.98398)
-    parser.add_argument("--pd-fraction", type=float, default=0.5)
 
-    parser.add_argument("--slab-model", required=True)
-    parser.add_argument("--ads-model", required=True)
-    parser.add_argument(
-        "--rep-model",
-        default=None,
-        help=(
-            "Optional CO-CO repulsion model. It is loaded lazily and used only "
-            "when N_CO > 1. If omitted and the MC reaches N_CO > 1, the run stops."
-        ),
-    )
-    parser.add_argument(
-        "--allow-unsafe-model-load",
-        action="store_true",
-        help="Use only for trusted local checkpoints if the installed SparseAtomicGPR supports it.",
-    )
+def namespace_from_config(cfg: dict) -> argparse.Namespace:
+    """Flatten the nested JSON config into the same flat attribute names the
+    old argparse.Namespace used to produce, so the rest of this module (main,
+    load_or_build_slab, etc.) is reused unchanged. See mc_grand.example.json.
+    """
+    structure = cfg.get("structure", {})
+    models = cfg.get("models", {})
+    thermo = cfg.get("thermo", {})
+    mc_cfg = cfg.get("mc", {})
+    output_cfg = cfg.get("output", {})
 
-    parser.add_argument("--temperature", type=float, default=300.0)
-    parser.add_argument(
-        "--delta-mu",
-        type=float,
-        default=0.0,
-        help="CO chemical-potential offset in eV. Larger values favor adsorption.",
-    )
+    if "slab_model" not in models:
+        raise ValueError("config.models must set slab_model.")
+    if not models.get("ads_model"):
+        raise ValueError("config.models must set ads_model.")
 
-    parser.add_argument("--nsteps", type=int, default=3000)
-    parser.add_argument("--alloy-attempts-per-step", type=int, default=1)
-    parser.add_argument("--co-attempts-per-step", type=int, default=1)
-
-    parser.add_argument("--co-height", type=float, default=1.60)
-    parser.add_argument("--co-bond", type=float, default=1.15)
-    parser.add_argument(
-        "--min-co-distance",
-        type=float,
-        default=1.52,
-        help="Hard C-C xy exclusion distance in angstrom. Use 0 to disable.",
+    return argparse.Namespace(
+        cell=structure.get("cell"),
+        cell_format=structure.get("cell_format"),
+        ignore_cell_adsorbates=bool(structure.get("ignore_cell_adsorbates", False)),
+        initial_site_match_tol=float(structure.get("initial_site_match_tol", 0.35)),
+        supercell=tuple(int(n) for n in structure.get("supercell", (4, 4, 6))),
+        lattice_constant=float(structure.get("lattice_constant", 3.98398)),
+        pd_fraction=float(structure.get("pd_fraction", 0.5)),
+        # Only used when structure.cell is null (synthetic build path) - the
+        # vacuum gap added on top of the built slab via ase.Atoms.center().
+        # Was hardcoded to 15.0 with no config knob at all; that recipe does
+        # NOT match whatever cell/vacuum convention a real DFT dataset used
+        # (e.g. this project's own ads_unified.db rows sit in a fixed
+        # 20.978 A cell - a synthetic build with vacuum=15.0 on a 4-layer
+        # slab lands at ~26 A, a different vacuum thickness entirely).
+        vacuum=float(structure.get("vacuum", 15.0)),
+        slab_model=models["slab_model"],
+        # The single per-CO adsorption model: additive across every occupied
+        # site, one descriptor row per carbon atom (the "carbon_atoms" style -
+        # see ads_unified's e_ads_total). Covers base adsorption energy AND
+        # CO-CO lateral interactions together - see
+        # LocalDescriptorEnergyEvaluator/CalculatorEnergyEvaluator.
+        ads_model=models["ads_model"],
+        freq_model=models.get("freq_model"),
+        allow_unsafe_model_load=bool(models.get("allow_unsafe_model_load", False)),
+        temperature=float(thermo.get("temperature", 300.0)),
+        delta_mu=float(thermo.get("delta_mu", 0.0)),
+        nsteps=int(mc_cfg.get("nsteps", 3000)),
+        co_height=float(mc_cfg.get("co_height", 1.60)),
+        co_bond=float(mc_cfg.get("co_bond", 1.15)),
+        min_co_distance=float(mc_cfg.get("min_co_distance", 1.52)),
+        z_atol=float(mc_cfg.get("z_atol", 1e-3)),
+        bridge_cutoff_factor=float(mc_cfg.get("bridge_cutoff_factor", 1.25)),
+        layer_z_tol=float(mc_cfg.get("layer_z_tol", 0.1)),
+        freeze_layers=tuple(int(x) for x in mc_cfg.get("freeze_layers", ())),
+        freeze_bottom_layers=int(mc_cfg.get("freeze_bottom_layers", 0)),
+        local_cutoff_margin=float(mc_cfg.get("local_cutoff_margin", 0.05)),
+        seed=int(cfg.get("seed", 1234)),
+        device=str(cfg.get("device", "cpu")),
+        evaluator_mode=str(cfg.get("evaluator_mode", "local")),
+        print_every=int(output_cfg.get("print_every", 100)),
+        write_every=int(output_cfg.get("write_every", 1000)),
+        trajectory=output_cfg.get("trajectory", "mc_semigrand_traj.xyz"),
+        output=output_cfg.get("output", "mc_semigrand_final.xyz"),
     )
-    parser.add_argument("--z-atol", type=float, default=1e-3)
-    parser.add_argument("--bridge-cutoff-factor", type=float, default=1.25)
-    parser.add_argument(
-        "--layer-z-tol",
-        type=float,
-        default=0.1,
-        help=(
-            "Tolerance in angstrom for grouping substrate atoms into z-layers. "
-            "Layer ids are numbered from 0 at the bottom of the slab."
-        ),
-    )
-    parser.add_argument(
-        "--freeze-layers",
-        type=int,
-        nargs="*",
-        default=(),
-        help=(
-            "Substrate layer ids to freeze during Pt/Pd swap MC. "
-            "Layer numbering starts from 0 at the bottom of the slab, e.g. "
-            "--freeze-layers 0 1 freezes the two bottom layers."
-        ),
-    )
-    parser.add_argument(
-        "--freeze-bottom-layers",
-        type=int,
-        default=0,
-        help=(
-            "Convenience option: freeze this many bottom substrate layers. "
-            "For example, --freeze-bottom-layers 2 is equivalent to --freeze-layers 0 1."
-        ),
-    )
-
-    parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--device", default="cpu")
-
-    parser.add_argument("--print-every", type=int, default=100)
-    parser.add_argument("--write-every", type=int, default=1000)
-    parser.add_argument("--trajectory", default="mc_semigrand_traj.xyz")
-    parser.add_argument("--output", default="mc_semigrand_final.xyz")
-
-    parser.add_argument(
-        "--active-learning",
-        action="store_true",
-        help="Write trial structures whose cached GP uncertainty exceeds --uncertainty-threshold.",
-    )
-    parser.add_argument("--uncertainty-threshold", type=float, default=float("inf"))
-    parser.add_argument("--active-learning-trajectory", default="active_learning_candidates.traj")
-
-    parser.add_argument(
-        "--local-cutoff-margin",
-        type=float,
-        default=0.05,
-        help="Margin added to max(config.shells_dict upper bound) for conservative local invalidation.",
-    )
-
-    return parser.parse_args()
 
 
 def validate_args(args: argparse.Namespace) -> None:
     positive_float(args.temperature, "temperature")
     finite_float(args.delta_mu, "delta_mu")
     positive_float(args.lattice_constant, "lattice_constant")
+    nonnegative_float(args.vacuum, "vacuum")
     if any(int(n) <= 0 for n in args.supercell):
         raise ValueError(f"all supercell dimensions must be positive, got {args.supercell}.")
     if not (0.0 <= float(args.pd_fraction) <= 1.0):
         raise ValueError(f"pd_fraction must be between 0 and 1, got {args.pd_fraction}.")
 
-    for name in ("nsteps", "alloy_attempts_per_step", "co_attempts_per_step", "print_every", "write_every"):
+    for name in ("nsteps", "print_every", "write_every"):
         if int(getattr(args, name)) < 0:
             raise ValueError(f"{name} must be non-negative, got {getattr(args, name)}.")
 
@@ -211,12 +184,34 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(f"freeze_bottom_layers must be non-negative, got {args.freeze_bottom_layers}.")
     if any(int(layer) < 0 for layer in args.freeze_layers):
         raise ValueError(f"freeze_layers must contain non-negative layer ids, got {args.freeze_layers}.")
+    if args.evaluator_mode not in ("local", "calculator"):
+        raise ValueError(f"evaluator_mode must be 'local' or 'calculator', got {args.evaluator_mode!r}.")
+    if args.ads_model is None:
+        raise ValueError("config.models must set ads_model - without it nothing predicts any adsorption energy.")
 
-    if args.active_learning:
-        if args.active_learning_trajectory in (None, ""):
-            raise ValueError("active_learning_trajectory must be non-empty in active-learning mode.")
-        if np.isnan(float(args.uncertainty_threshold)):
-            raise ValueError("uncertainty_threshold must not be NaN.")
+
+def validate_active_learning_config(al_cfg: dict | None) -> None:
+    if not al_cfg or not al_cfg.get("enabled", False):
+        return
+
+    if not al_cfg.get("run_script"):
+        raise ValueError("active_learning.run_script is required when active_learning.enabled is true.")
+    if not os.path.exists(al_cfg["run_script"]):
+        raise ValueError(f"active_learning.run_script does not exist: {al_cfg['run_script']!r}.")
+
+    datasets = al_cfg.get("_datasets", {})
+    train_configs = al_cfg.get("train_configs", {})
+    thresholds = al_cfg.get("uncertainty_thresholds", {})
+    for component in ActiveLearningController.COMPONENTS:
+        if component not in datasets:
+            raise ValueError(f"active_learning._datasets.{component} is required.")
+        if component not in train_configs:
+            raise ValueError(f"active_learning.train_configs.{component} is required.")
+        if not os.path.exists(train_configs[component]):
+            raise ValueError(f"active_learning.train_configs.{component} does not exist: {train_configs[component]!r}.")
+        threshold = float(thresholds.get(component, float("inf")))
+        if np.isnan(threshold):
+            raise ValueError(f"active_learning.uncertainty_thresholds.{component} must not be NaN.")
 
 
 def _ensure_parent_dir(path: str | os.PathLike | None) -> None:
@@ -234,14 +229,16 @@ def _safe_set_torch_threads(n_threads: int = 1) -> None:
 
 
 def load_or_build_slab(args: argparse.Namespace):
+    """structure.cell must be set explicitly to load a real structure - no
+    implicit filesystem sniffing (this used to silently pick up a same-named
+    POSCAR sitting in the current directory if structure.cell was left null,
+    which could load an unrelated leftover file with zero indication in the
+    config or the log)."""
 
     input_atoms = None
 
     if args.cell is not None:
         input_atoms = read(args.cell, format=args.cell_format)
-        slab_atoms = strip_to_symbols(input_atoms, keep_symbols=("Pt", "Pd"))
-    elif os.path.exists("POSCAR"):
-        input_atoms = read("POSCAR", format="vasp")
         slab_atoms = strip_to_symbols(input_atoms, keep_symbols=("Pt", "Pd"))
     else:
         slab_atoms = build_supercell(
@@ -251,7 +248,7 @@ def load_or_build_slab(args: argparse.Namespace):
             supercell=np.diag(args.supercell),
             seed=args.seed,
         )
-        slab_atoms.center(vacuum=15.0, axis=2)
+        slab_atoms.center(vacuum=args.vacuum, axis=2)
         slab_atoms.pbc = (True, True, False)
 
     if len(slab_atoms) == 0:
@@ -415,12 +412,12 @@ class LocalDescriptorEnergyEvaluator:
         self,
         file_slab_model: str,
         file_ads_model: str,
-        file_rep_model: str | None,
         sites: Iterable[AdsorptionSite],
         co_bond: float,
         device: str = "cpu",
         allow_unsafe_load: bool = False,
         local_cutoff_margin: float = 0.05,
+        file_freq_model: str | None = None,
     ):
         self.device = device
         self.sites = validate_sites(list(sites))
@@ -428,65 +425,67 @@ class LocalDescriptorEnergyEvaluator:
         self.local_cutoff_margin = nonnegative_float(local_cutoff_margin, "local_cutoff_margin")
         self.allow_unsafe_load = bool(allow_unsafe_load)
 
+        self.file_slab_model = file_slab_model
         self.slab_model = _load_sparse_model(file_slab_model, device, allow_unsafe_load)
-        self.ads_model = _load_sparse_model(file_ads_model, device, allow_unsafe_load)
-
-        self.file_rep_model = file_rep_model
-        self.rep_model: SparseAtomicGPR | None = None
-        self.rep_extractor: ClusterExpansion | None = None
-
         self.slab_extractor = ClusterExpansion(self.slab_model.config)
+
+        # The single per-CO adsorption model: additive across every occupied
+        # site, one descriptor row per carbon atom (see ads_unified's
+        # e_ads_total) - covers base adsorption energy AND CO-CO lateral
+        # interactions together, so it must contribute starting at N_CO=1
+        # (there is no separate "first CO free" base-adsorption component
+        # anymore).
+        self.file_ads_model = file_ads_model
+        self.ads_model = _load_sparse_model(file_ads_model, device, allow_unsafe_load)
+        ads_elements = set(self.ads_model.config.elements)
+        if "C" not in ads_elements:
+            raise ValueError(
+                "ads model must support carbon-centered descriptors (one row "
+                f"per adsorbed CO); got elements {sorted(ads_elements)}."
+            )
         self.ads_extractor = ClusterExpansion(self.ads_model.config)
 
         self.slab_cutoff = cutoff_from_shells_dict(self.slab_model.config, self.local_cutoff_margin)
         self.ads_cutoff = cutoff_from_shells_dict(self.ads_model.config, self.local_cutoff_margin)
-        self.rep_cutoff = float("nan")
+
+        # Stub: see CalculatorEnergyEvaluator's identical freq_model wiring -
+        # loaded/validated but not yet used in any energy/uncertainty below.
+        self.file_freq_model = file_freq_model
+        self.freq_model: SparseAtomicGPR | None = (
+            _load_sparse_model(file_freq_model, device, allow_unsafe_load)
+            if file_freq_model is not None
+            else None
+        )
+        self.freq_extractor = ClusterExpansion(self.freq_model.config) if self.freq_model is not None else None
 
         self._validate_model_elements()
+
+    def reload_model(self, component: str, model_path: str) -> None:
+        """Hot-swap one component's checkpoint (slab/ads) after an
+        active-learning retraining cycle. Any cached kernel rows referencing
+        the OLD model (state.slab_k/ads_k) are stale after this and must be
+        rebuilt via full_rebuild() - the caller (GrandCO_MC) already does
+        that right after a retraining cycle."""
+        if component not in ("slab", "ads"):
+            raise ValueError(f"Unknown component {component!r}; expected 'slab' or 'ads'.")
+
+        model = _load_sparse_model(model_path, self.device, self.allow_unsafe_load)
+        extractor = ClusterExpansion(model.config)
+        cutoff = cutoff_from_shells_dict(model.config, self.local_cutoff_margin)
+
+        setattr(self, f"{component}_model", model)
+        setattr(self, f"{component}_extractor", extractor)
+        setattr(self, f"{component}_cutoff", cutoff)
 
     def _validate_model_elements(self) -> None:
 
         slab_elements = set(self.slab_model.config.elements)
-        ads_elements = set(self.ads_model.config.elements)
-
         required_metals = {"Pt", "Pd"}
 
         if not required_metals.issubset(slab_elements):
             raise ValueError(
                 f"slab model elements must include Pt and Pd, got {sorted(slab_elements)}."
             )
-
-        if not required_metals.issubset(ads_elements):
-            raise ValueError(
-                "ads model is evaluated on metal-centered adsorption-site "
-                f"descriptors and must include Pt and Pd; got {sorted(ads_elements)}."
-            )
-
-    def _require_rep_model(self) -> SparseAtomicGPR:
-        """Load and validate rep_model only when a CO-CO term is actually needed."""
-        if self.rep_model is not None:
-            return self.rep_model
-
-        if self.file_rep_model is None:
-            raise RuntimeError(
-                "N_CO > 1 requires a CO-CO repulsion model, but --rep-model was not provided. "
-                "For N_CO = 0 or 1 the repulsion term is skipped automatically."
-            )
-
-        self.rep_model = _load_sparse_model(
-            self.file_rep_model,
-            self.device,
-            self.allow_unsafe_load,
-        )
-        rep_elements = set(self.rep_model.config.elements)
-        if "C" not in rep_elements:
-            raise ValueError(
-                "rep model is evaluated only when N_CO > 1 and must support "
-                f"carbon-centered descriptors; got elements {sorted(rep_elements)}."
-            )
-        self.rep_extractor = ClusterExpansion(self.rep_model.config)
-        self.rep_cutoff = cutoff_from_shells_dict(self.rep_model.config, self.local_cutoff_margin)
-        return self.rep_model
 
     def make_atoms(self, slab_atoms, occupation: np.ndarray):
         return build_adsorbed_structure(
@@ -497,7 +496,7 @@ class LocalDescriptorEnergyEvaluator:
         )
 
     def cutoffs(self) -> dict[str, float]:
-        return {"slab": self.slab_cutoff, "ads": self.ads_cutoff, "rep": self.rep_cutoff}
+        return {"slab": self.slab_cutoff, "ads": self.ads_cutoff}
 
     def initial_state(
         self,
@@ -516,17 +515,19 @@ class LocalDescriptorEnergyEvaluator:
         validate_sites(self.sites, n_atoms=len(slab_atoms))
         atoms = self.make_atoms(slab_atoms, occupation)
 
-        slab_k = self._build_all_slab_rows(slab_atoms)
-        ads_k = self._build_all_ads_rows(atoms, occupation)
-        rep_k = self._build_all_rep_rows(atoms, slab_atoms, occupation)
-        energy = self._energy_from_k_maps(slab_k, ads_k, rep_k, compute_uncertainty=compute_uncertainty)
+        slab_k, slab_desc = self._build_all_slab_rows(slab_atoms)
+        ads_k, ads_desc = self._build_all_ads_rows(atoms, slab_atoms, occupation)
+        energy = self._energy_from_k_maps(
+            slab_k, ads_k, slab_desc, ads_desc, compute_uncertainty=compute_uncertainty
+        )
         return LocalMCState(
             slab_atoms=slab_atoms.copy(),
             occupation=occupation.copy(),
             energy=energy,
             slab_k=slab_k,
             ads_k=ads_k,
-            rep_k=rep_k,
+            slab_desc=slab_desc,
+            ads_desc=ads_desc,
         )
 
     def local_update(
@@ -549,14 +550,18 @@ class LocalDescriptorEnergyEvaluator:
         atoms = self.make_atoms(candidate_slab_atoms, candidate_occupation)
 
         slab_k = dict(state.slab_k)
+        slab_desc = dict(state.slab_desc)
         ads_k = {site_id: k for site_id, k in state.ads_k.items() if bool(candidate_occupation[site_id])}
-        rep_k = {site_id: k for site_id, k in state.rep_k.items() if bool(candidate_occupation[site_id])}
+        ads_desc = {site_id: d for site_id, d in state.ads_desc.items() if bool(candidate_occupation[site_id])}
 
         affected_slab = self._affected_slab_centers(candidate_slab_atoms, changed_metal_indices)
-        slab_k.update(self._slab_k_rows(candidate_slab_atoms, affected_slab))
+        new_slab_k, new_slab_desc = self._slab_k_rows(candidate_slab_atoms, affected_slab)
+        slab_k.update(new_slab_k)
+        slab_desc.update(new_slab_desc)
 
         affected_ads = self._affected_ads_sites(
             candidate_slab_atoms=candidate_slab_atoms,
+            old_occupation=state.occupation,
             candidate_occupation=candidate_occupation,
             changed_metal_indices=changed_metal_indices,
             changed_site_ids=changed_site_ids,
@@ -569,51 +574,27 @@ class LocalDescriptorEnergyEvaluator:
         for site_id in affected_ads:
             if not bool(candidate_occupation[int(site_id)]):
                 ads_k.pop(int(site_id), None)
-        ads_k.update(self._ads_k_rows(atoms, affected_ads_occupied))
-
-        affected_rep = self._affected_rep_sites(
-            candidate_slab_atoms=candidate_slab_atoms,
-            old_occupation=state.occupation,
-            candidate_occupation=candidate_occupation,
-            changed_metal_indices=changed_metal_indices,
-            changed_site_ids=changed_site_ids,
+                ads_desc.pop(int(site_id), None)
+        new_ads_k, new_ads_desc = self._ads_k_rows(
+            atoms=atoms,
+            slab_atoms=candidate_slab_atoms,
+            occupation=candidate_occupation,
+            site_ids=affected_ads_occupied,
         )
-        n_co = int(candidate_occupation.sum())
-        if n_co <= 1:
-            # There is no CO-CO pair at N_CO <= 1.  The first CO is therefore
-            # intentionally absent from rep_k until a second CO appears.
-            rep_k = {}
-        else:
-            if int(state.occupation.sum()) <= 1:
-                # Transition 1 -> 2 CO: both the old first CO and the new CO
-                # must enter the repulsion cache.  This is the point where the
-                # first CO starts contributing to the repulsion model.
-                affected_rep = set(np.where(candidate_occupation)[0].astype(int))
-            affected_rep_occupied = [
-                int(site_id)
-                for site_id in sorted(affected_rep)
-                if bool(candidate_occupation[int(site_id)])
-            ]
-            for site_id in affected_rep:
-                if not bool(candidate_occupation[int(site_id)]):
-                    rep_k.pop(int(site_id), None)
-            rep_k.update(
-                self._rep_k_rows(
-                    atoms=atoms,
-                    slab_atoms=candidate_slab_atoms,
-                    occupation=candidate_occupation,
-                    site_ids=affected_rep_occupied,
-                )
-            )
+        ads_k.update(new_ads_k)
+        ads_desc.update(new_ads_desc)
 
-        energy = self._energy_from_k_maps(slab_k, ads_k, rep_k, compute_uncertainty=compute_uncertainty)
+        energy = self._energy_from_k_maps(
+            slab_k, ads_k, slab_desc, ads_desc, compute_uncertainty=compute_uncertainty
+        )
         return LocalMCState(
             slab_atoms=candidate_slab_atoms.copy(),
             occupation=candidate_occupation.copy(),
             energy=energy,
             slab_k=slab_k,
             ads_k=ads_k,
-            rep_k=rep_k,
+            slab_desc=slab_desc,
+            ads_desc=ads_desc,
         )
 
 
@@ -631,108 +612,45 @@ class LocalDescriptorEnergyEvaluator:
             return torch.empty((0, model.x_M.shape[0]), dtype=torch.float64, device=model.x_M.device)
         return model.rbf_kernel(x, model.x_M).detach()
 
-    def _slab_k_rows(self, slab_atoms, atom_indices: Iterable[int]) -> dict[int, torch.Tensor]:
+    def _slab_k_rows(
+        self, slab_atoms, atom_indices: Iterable[int]
+    ) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
 
         atom_indices = [int(i) for i in atom_indices]
         if not atom_indices:
-            return {}
+            return {}, {}
         atom_indices = sorted(set(atom_indices))
         desc = self.slab_extractor(slab_atoms, atom_indices=atom_indices)
-        k_rows = self._descriptor_k_rows(self.slab_model, desc)
+        desc_t = torch.as_tensor(desc, dtype=torch.float64, device=self.slab_model.x_M.device)
+        k_rows = self._descriptor_k_rows(self.slab_model, desc_t)
         if k_rows.shape[0] != len(atom_indices):
             raise RuntimeError(
                 f"Number of slab kernel rows does not match requested centers: "
                 f"got {k_rows.shape[0]}, expected {len(atom_indices)}."
             )
-        return {int(atom_index): k_rows[pos] for pos, atom_index in enumerate(atom_indices)}
+        k_map = {int(atom_index): k_rows[pos] for pos, atom_index in enumerate(atom_indices)}
+        desc_map = {int(atom_index): desc_t[pos] for pos, atom_index in enumerate(atom_indices)}
+        return k_map, desc_map
 
     def _slab_k_row(self, slab_atoms, atom_index: int) -> torch.Tensor:
-        rows = self._slab_k_rows(slab_atoms, [int(atom_index)])
-        return rows[int(atom_index)]
+        k_map, _ = self._slab_k_rows(slab_atoms, [int(atom_index)])
+        return k_map[int(atom_index)]
 
-    def _ads_k_rows(self, atoms, site_ids: Iterable[int]) -> dict[int, torch.Tensor]:
-
-        site_ids = [int(site_id) for site_id in site_ids]
-        if not site_ids:
-            return {}
-        site_ids = sorted(set(site_ids))
-
-        metal_indices: list[int] = []
-        for site_id in site_ids:
-            if site_id < 0 or site_id >= len(self.sites):
-                raise IndexError(f"site_id {site_id} is out of range.")
-            metal_indices.extend(int(i) for i in self.sites[site_id].atom_indices)
-
-        metal_indices_unique = sorted(set(metal_indices))
-        if not metal_indices_unique:
-            raise RuntimeError("Cannot build adsorption descriptors without site-defining metal atoms.")
-
-        desc = self.ads_extractor(atoms, atom_indices=metal_indices_unique)
-        desc_t = torch.as_tensor(desc, dtype=torch.float64, device=self.ads_model.x_M.device)
-        if desc_t.ndim != 2:
-            raise RuntimeError(f"ads descriptor block is not 2D, got shape {tuple(desc_t.shape)}.")
-        if desc_t.shape[0] != len(metal_indices_unique):
-            raise RuntimeError(
-                f"ads descriptor block has {desc_t.shape[0]} rows, "
-                f"expected {len(metal_indices_unique)}."
-            )
-
-        row_by_metal = {
-            int(atom_index): desc_t[pos]
-            for pos, atom_index in enumerate(metal_indices_unique)
-        }
-        site_desc_rows = []
-        valid_site_ids = []
-        for site_id in site_ids:
-            site = self.sites[int(site_id)]
-            rows = [row_by_metal[int(atom_index)] for atom_index in site.atom_indices]
-            site_desc = torch.stack(rows, dim=0).sum(dim=0, keepdim=False)
-            site_desc_rows.append(site_desc)
-            valid_site_ids.append(int(site_id))
-
-        site_desc_block = torch.stack(site_desc_rows, dim=0)
-        k_rows = self._descriptor_k_rows(self.ads_model, site_desc_block)
-        if k_rows.shape[0] != len(valid_site_ids):
-            raise RuntimeError(
-                f"Number of ads kernel rows does not match requested sites: "
-                f"got {k_rows.shape[0]}, expected {len(valid_site_ids)}."
-            )
-        return {site_id: k_rows[pos] for pos, site_id in enumerate(valid_site_ids)}
-
-    def _ads_site_descriptor(self, atoms, site_id: int):
-
-        site = self.sites[int(site_id)]
-        desc = self.ads_extractor(atoms, atom_indices=list(site.atom_indices))
-        desc_t = torch.as_tensor(desc, dtype=torch.float64, device=self.ads_model.x_M.device)
-        if desc_t.ndim != 2:
-            raise RuntimeError(f"ads descriptor for site {site_id} is not 2D.")
-        if desc_t.shape[0] != len(site.atom_indices):
-            raise RuntimeError(
-                f"ads descriptor for site {site_id} has {desc_t.shape[0]} rows, "
-                f"expected {len(site.atom_indices)}."
-            )
-        return desc_t.sum(dim=0, keepdim=True)
-
-    def _ads_k_row(self, atoms, site_id: int) -> torch.Tensor:
-        rows = self._ads_k_rows(atoms, [int(site_id)])
-        return rows[int(site_id)]
-
-    def _rep_k_rows(
+    def _ads_k_rows(
         self,
         atoms,
         slab_atoms,
         occupation: np.ndarray,
         site_ids: Iterable[int],
-    ) -> dict[int, torch.Tensor]:
+    ) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
+        """One descriptor row per occupied CO's carbon atom (additive - see
+        the class docstring). Every site_id here must already be occupied in
+        `occupation`."""
 
         site_ids = [int(site_id) for site_id in site_ids]
         if not site_ids:
-            return {}
+            return {}, {}
         site_ids = sorted(set(site_ids))
-
-        rep_model = self._require_rep_model()
-        if self.rep_extractor is None:
-            raise RuntimeError("Internal error: rep_extractor was not initialized after loading rep_model.")
 
         c_map = carbon_index_by_site_id(len(slab_atoms), occupation)
         carbon_indices = []
@@ -743,31 +661,30 @@ class LocalDescriptorEnergyEvaluator:
             valid_site_ids.append(int(site_id))
             carbon_indices.append(int(c_map[int(site_id)]))
 
-        desc = self.rep_extractor(atoms, atom_indices=carbon_indices)
-        k_rows = self._descriptor_k_rows(rep_model, desc)
+        desc = self.ads_extractor(atoms, atom_indices=carbon_indices)
+        desc_t = torch.as_tensor(desc, dtype=torch.float64, device=self.ads_model.x_M.device)
+        k_rows = self._descriptor_k_rows(self.ads_model, desc_t)
         if k_rows.shape[0] != len(valid_site_ids):
             raise RuntimeError(
-                f"Number of rep kernel rows does not match requested sites: "
+                f"Number of ads kernel rows does not match requested sites: "
                 f"got {k_rows.shape[0]}, expected {len(valid_site_ids)}."
             )
-        return {site_id: k_rows[pos] for pos, site_id in enumerate(valid_site_ids)}
+        k_map = {site_id: k_rows[pos] for pos, site_id in enumerate(valid_site_ids)}
+        desc_map = {site_id: desc_t[pos] for pos, site_id in enumerate(valid_site_ids)}
+        return k_map, desc_map
 
-    def _rep_k_row(self, atoms, slab_atoms, occupation: np.ndarray, site_id: int) -> torch.Tensor:
-        rows = self._rep_k_rows(atoms, slab_atoms, occupation, [int(site_id)])
-        return rows[int(site_id)]
+    def _ads_k_row(self, atoms, slab_atoms, occupation: np.ndarray, site_id: int) -> torch.Tensor:
+        k_map, _ = self._ads_k_rows(atoms, slab_atoms, occupation, [int(site_id)])
+        return k_map[int(site_id)]
 
-    def _build_all_slab_rows(self, slab_atoms) -> dict[int, torch.Tensor]:
+    def _build_all_slab_rows(self, slab_atoms) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
         return self._slab_k_rows(slab_atoms, range(len(slab_atoms)))
 
-    def _build_all_ads_rows(self, atoms, occupation: np.ndarray) -> dict[int, torch.Tensor]:
+    def _build_all_ads_rows(
+        self, atoms, slab_atoms, occupation: np.ndarray
+    ) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
         occupied_site_ids = np.where(occupation)[0].astype(int)
-        return self._ads_k_rows(atoms, occupied_site_ids)
-
-    def _build_all_rep_rows(self, atoms, slab_atoms, occupation: np.ndarray) -> dict[int, torch.Tensor]:
-        if int(occupation.sum()) <= 1:
-            return {}
-        occupied_site_ids = np.where(occupation)[0].astype(int)
-        return self._rep_k_rows(atoms, slab_atoms, occupation, occupied_site_ids)
+        return self._ads_k_rows(atoms, slab_atoms, occupation, occupied_site_ids)
 
 
     def _affected_slab_centers(self, slab_atoms, changed_metal_indices: set[int]) -> set[int]:
@@ -775,62 +692,27 @@ class LocalDescriptorEnergyEvaluator:
             return set()
         if not np.isfinite(self.slab_cutoff):
             return set(range(len(slab_atoms)))
+
         positions = slab_atoms.get_positions()
-        affected: set[int] = set(changed_metal_indices)
-        for center in range(len(slab_atoms)):
-            center_pos = positions[center]
-            for changed in changed_metal_indices:
-                d = mic_distance(center_pos, positions[int(changed)], slab_atoms.cell, slab_atoms.pbc)
-                if d <= self.slab_cutoff:
-                    affected.add(int(center))
-                    break
+        changed_idx = np.array(sorted(changed_metal_indices), dtype=int)
+        pbc = [bool(x) for x in slab_atoms.pbc]
+
+        # One vectorized ASE call instead of a Python double loop over every
+        # (center, changed) pair each calling mic_distance -> find_mic
+        # individually: find_mic's general path re-runs a Minkowski cell
+        # reduction on EVERY call, which is invariant across all of these
+        # pairs (the cell doesn't change) - doing that once per changed-atom
+        # batch instead of once per pair was the actual bottleneck (87k
+        # mic_distance calls / ~20s of a 100-step, 384-atom MC run).
+        _, dist = get_distances(positions[changed_idx], positions, cell=slab_atoms.cell, pbc=pbc)
+        affected = set(np.where(np.any(dist <= self.slab_cutoff, axis=0))[0].astype(int).tolist())
+        affected.update(int(i) for i in changed_metal_indices)
         return affected
 
     def _changed_co_positions(self, changed_site_ids: set[int]) -> list[np.ndarray]:
         return [np.asarray(self.sites[int(site_id)].position, dtype=np.float64) for site_id in changed_site_ids]
 
     def _affected_ads_sites(
-        self,
-        candidate_slab_atoms,
-        candidate_occupation: np.ndarray,
-        changed_metal_indices: set[int],
-        changed_site_ids: set[int],
-    ) -> set[int]:
-        occupied = set(np.where(candidate_occupation)[0].astype(int))
-        affected = set(changed_site_ids)
-        if not occupied:
-            return affected
-
-        positions = candidate_slab_atoms.get_positions()
-        changed_co_positions = self._changed_co_positions(changed_site_ids)
-        conservative_all = not np.isfinite(self.ads_cutoff)
-
-        for site_id in occupied:
-            site = self.sites[int(site_id)]
-            if conservative_all:
-                affected.add(int(site_id))
-                continue
-
-            for center_idx in site.atom_indices:
-                center_pos = positions[int(center_idx)]
-
-                for co_pos in changed_co_positions:
-                    if mic_distance(center_pos, co_pos, candidate_slab_atoms.cell, candidate_slab_atoms.pbc) <= self.ads_cutoff:
-                        affected.add(int(site_id))
-                        break
-                if int(site_id) in affected:
-                    break
-
-                for changed_idx in changed_metal_indices:
-                    if mic_distance(center_pos, positions[int(changed_idx)], candidate_slab_atoms.cell, candidate_slab_atoms.pbc) <= self.ads_cutoff:
-                        affected.add(int(site_id))
-                        break
-                if int(site_id) in affected:
-                    break
-
-        return affected
-
-    def _affected_rep_sites(
         self,
         candidate_slab_atoms,
         old_occupation: np.ndarray,
@@ -845,30 +727,29 @@ class LocalDescriptorEnergyEvaluator:
         if n_old <= 1:
             return set(np.where(candidate_occupation)[0].astype(int))
 
-        occupied = set(np.where(candidate_occupation)[0].astype(int))
+        occupied = sorted(int(i) for i in np.where(candidate_occupation)[0])
         affected = set(changed_site_ids)
-        changed_co_positions = self._changed_co_positions(changed_site_ids)
+
+        if not np.isfinite(self.ads_cutoff):
+            affected.update(occupied)
+            return affected
+
         positions = candidate_slab_atoms.get_positions()
-        conservative_all = not np.isfinite(self.rep_cutoff)
+        query_positions = list(self._changed_co_positions(changed_site_ids))
+        query_positions.extend(positions[int(i)] for i in changed_metal_indices)
+        if not query_positions:
+            return affected
 
-        for site_id in occupied:
-            site_pos = np.asarray(self.sites[int(site_id)].position, dtype=np.float64)
-            if conservative_all:
-                affected.add(int(site_id))
-                continue
-
-            for co_pos in changed_co_positions:
-                if mic_distance(site_pos, co_pos, candidate_slab_atoms.cell, candidate_slab_atoms.pbc) <= self.rep_cutoff:
-                    affected.add(int(site_id))
-                    break
-            if int(site_id) in affected:
-                continue
-
-            for changed_idx in changed_metal_indices:
-                if mic_distance(site_pos, positions[int(changed_idx)], candidate_slab_atoms.cell, candidate_slab_atoms.pbc) <= self.rep_cutoff:
-                    affected.add(int(site_id))
-                    break
-
+        site_positions = np.asarray([self.sites[sid].position for sid in occupied], dtype=np.float64)
+        pbc = [bool(x) for x in candidate_slab_atoms.pbc]
+        _, dist = get_distances(
+            np.asarray(query_positions, dtype=np.float64),
+            site_positions,
+            cell=candidate_slab_atoms.cell,
+            pbc=pbc,
+        )
+        hit = np.any(dist <= self.ads_cutoff, axis=0)
+        affected.update(site_id for site_id, is_hit in zip(occupied, hit) if is_hit)
         return affected
 
 
@@ -880,39 +761,69 @@ class LocalDescriptorEnergyEvaluator:
         return torch.stack(rows, dim=0).sum(dim=0)
 
     @staticmethod
-    def _mean_from_k(model: SparseAtomicGPR, k_sum: torch.Tensor) -> float:
-        value = (k_sum.to(model.x_M.device) @ model.c.to(model.x_M.device)).detach().cpu().item()
-        return finite_float(value, "component_energy")
+    def _mean_from_k(
+        model: SparseAtomicGPR,
+        k_sum: torch.Tensor,
+        desc_map: dict[int, torch.Tensor] | None = None,
+    ) -> float:
+        value = k_sum.to(model.x_M.device) @ model.c.to(model.x_M.device)
+        # The kernel part of forward() only ever predicts the RESIDUAL from
+        # the model's mean function (see gpr.py's fit_c/forward) - add that
+        # back here too, from the cached raw descriptor rows, or a
+        # mean_function="linear" model's energy would silently be missing
+        # its (usually dominant, for anything past the training envelope)
+        # linear trend term.
+        linear_mean = getattr(model, "linear_mean", None)
+        if linear_mean is not None and desc_map:
+            desc_sum = torch.stack(
+                [d.to(dtype=linear_mean.dtype, device=linear_mean.device) for d in desc_map.values()],
+                dim=0,
+            ).sum(dim=0)
+            value = value + desc_sum @ linear_mean
+        return finite_float(value.detach().cpu().item(), "component_energy")
 
     @staticmethod
-    def _cached_K_MM_inv_K_NM_train_T(model: SparseAtomicGPR) -> torch.Tensor:
-
-        cache_name = "_localdesc_K_MM_inv_K_NM_train_T"
-        cached = getattr(model, cache_name, None)
-        if cached is not None:
-            return cached
-        value = torch.cholesky_solve(model.K_NM_train.T, model.L_KMM).detach()
-        setattr(model, cache_name, value)
-        return value
-
-    @staticmethod
-    def _mean_std_from_k(model: SparseAtomicGPR, k_sum: torch.Tensor) -> tuple[float, float]:
+    def _mean_std_from_desc_and_k(
+        model: SparseAtomicGPR, desc_map: dict[int, torch.Tensor], k_sum: torch.Tensor
+    ) -> tuple[float, float]:
+        """Exact Projected-Process variance (same formula as
+        SparseAtomicGPR.predict_uncertainty in gpr.py - see that method's
+        docstring), computed from this component's cached kernel-row sum
+        (k_sum, equivalent to a row of build_K_NM) plus its cached RAW
+        descriptor rows (desc_map - one per cached atom/site, NOT
+        kernel-projected). The self-kernel term k(x*,x*) genuinely needs
+        those raw rows: it's the only term in the PP formula that isn't
+        expressible from k_sum alone, and it's also the term that carries
+        "how far this structure is from anything in x_M" - dropping it (the
+        previous version of this function did, via an SoR-style
+        approximation, back when it also referenced the now-removed
+        N x N `L_KSS`) silently throws away exactly the extrapolation
+        signal this is meant to catch.
+        """
         k_sum = k_sum.to(dtype=torch.float64, device=model.x_M.device)
-        mean = LocalDescriptorEnergyEvaluator._mean_from_k(model, k_sum)
+        mean = LocalDescriptorEnergyEvaluator._mean_from_k(model, k_sum, desc_map)
 
-        if getattr(model, "K_NM_train", None) is None or getattr(model, "L_KMM", None) is None or getattr(model, "L_KSS", None) is None:
+        if (
+            getattr(model, "L_KMM", None) is None
+            or getattr(model, "L_A", None) is None
+            or not desc_map
+        ):
             return mean, float("nan")
 
-        K_test = k_sum.reshape(1, -1)
-        K_MM_inv_K_NM_train_T = LocalDescriptorEnergyEvaluator._cached_K_MM_inv_K_NM_train_T(model)
-        K_star_S = K_test @ K_MM_inv_K_NM_train_T
+        desc_stack = torch.stack(
+            [d.to(dtype=torch.float64, device=model.x_M.device) for d in desc_map.values()], dim=0
+        )
 
-        K_MM_inv_K_NM_test_T = torch.cholesky_solve(K_test.T, model.L_KMM)
-        K_star_star = K_test @ K_MM_inv_K_NM_test_T
+        K_test = k_sum.reshape(1, -1)  # (1, M)
+        K_diag_true = model.rbf_kernel(desc_stack, desc_stack).sum().reshape(1)
 
-        tmp = torch.cholesky_solve(K_star_S.T, model.L_KSS)
-        cov = K_star_star - K_star_S @ tmp
-        var = torch.clamp(cov.diagonal(), min=1e-12)
+        K_MM_inv_k_starM = torch.cholesky_solve(K_test.T, model.L_KMM)  # (M, 1)
+        Q_diag = (K_test * K_MM_inv_k_starM.T).sum(dim=1)
+
+        A_inv_k_starM = torch.cholesky_solve(K_test.T, model.L_A)  # (M, 1)
+        pp_correction = model.sigma2 * (K_test * A_inv_k_starM.T).sum(dim=1)
+
+        var = torch.clamp(K_diag_true - Q_diag + pp_correction, min=1e-12)
         std = torch.sqrt(var)[0].detach().cpu().item()
         return mean, finite_float(std, "component_uncertainty")
 
@@ -920,46 +831,37 @@ class LocalDescriptorEnergyEvaluator:
         self,
         slab_k: dict[int, torch.Tensor],
         ads_k: dict[int, torch.Tensor],
-        rep_k: dict[int, torch.Tensor],
+        slab_desc: dict[int, torch.Tensor] | None = None,
+        ads_desc: dict[int, torch.Tensor] | None = None,
         *,
         compute_uncertainty: bool = False,
     ) -> EnergyComponents:
         slab_sum = self._sum_k(slab_k, self.slab_model)
         ads_sum = self._sum_k(ads_k, self.ads_model)
 
-        if rep_k:
-            rep_model = self._require_rep_model()
-            rep_sum = self._sum_k(rep_k, rep_model)
-        else:
-            rep_model = None
-            rep_sum = None
-
         if compute_uncertainty:
-            slab_e, slab_u = self._mean_std_from_k(self.slab_model, slab_sum)
-            ads_e, ads_u = (0.0, 0.0) if not ads_k else self._mean_std_from_k(self.ads_model, ads_sum)
-            rep_e, rep_u = (0.0, 0.0) if rep_model is None else self._mean_std_from_k(rep_model, rep_sum)
-            if np.isfinite(slab_u) and np.isfinite(ads_u) and np.isfinite(rep_u):
-                unc = float(np.sqrt(slab_u**2 + ads_u**2 + rep_u**2))
+            slab_e, slab_u = self._mean_std_from_desc_and_k(self.slab_model, slab_desc or {}, slab_sum)
+            ads_e, ads_u = (
+                (0.0, 0.0) if not ads_k else self._mean_std_from_desc_and_k(self.ads_model, ads_desc or {}, ads_sum)
+            )
+            if np.isfinite(slab_u) and np.isfinite(ads_u):
+                unc = float(np.sqrt(slab_u**2 + ads_u**2))
             else:
                 unc = float("nan")
         else:
-            slab_e = self._mean_from_k(self.slab_model, slab_sum)
-            ads_e = 0.0 if not ads_k else self._mean_from_k(self.ads_model, ads_sum)
-            rep_e = 0.0 if rep_model is None else self._mean_from_k(rep_model, rep_sum)
+            slab_e = self._mean_from_k(self.slab_model, slab_sum, slab_desc)
+            ads_e = 0.0 if not ads_k else self._mean_from_k(self.ads_model, ads_sum, ads_desc)
             unc = float("nan")
             slab_u = float("nan")
             ads_u = float("nan")
-            rep_u = float("nan")
 
         return EnergyComponents(
-            total=slab_e + ads_e + rep_e,
+            total=slab_e + ads_e,
             slab=slab_e,
             ads=ads_e,
-            rep=rep_e,
             uncertainty=unc,
             uncertainty_slab=slab_u,
             uncertainty_ads=ads_u,
-            uncertainty_rep=rep_u,
         )
 
 
@@ -990,30 +892,54 @@ class CalculatorEnergyEvaluator:
         self,
         file_slab_model: str,
         file_ads_model: str,
-        file_rep_model: str | None,
         sites: Iterable[AdsorptionSite],
         co_bond: float,
         device: str = "cpu",
         allow_unsafe_load: bool = False,
         local_cutoff_margin: float = 0.05,
+        file_freq_model: str | None = None,
     ):
         self.device = device
         self.sites = validate_sites(list(sites))
         self.co_bond = positive_float(co_bond, "co_bond")
         self.allow_unsafe_load = bool(allow_unsafe_load)
         self.local_cutoff_margin = nonnegative_float(local_cutoff_margin, "local_cutoff_margin")
+        self.file_slab_model = file_slab_model
+        self.file_ads_model = file_ads_model
 
         signature = inspect.signature(CalculatorCESparseGPR)
         kwargs = {
             "file_slab_model": file_slab_model,
             "file_ads_model": file_ads_model,
-            "file_rep_model": file_rep_model,
             "device": device,
         }
         if "allow_unsafe_load" in signature.parameters:
             kwargs["allow_unsafe_load"] = bool(allow_unsafe_load)
 
         self.calculator = CalculatorCESparseGPR(**kwargs)
+
+        # Stub: a future CO-vibrational-frequency model. Loaded here so its
+        # checkpoint/config are validated early, but it does not yet
+        # contribute to any energy/uncertainty below - that needs a defined
+        # physical role (e.g. a ZPE/entropy correction to delta_mu) first.
+        self.file_freq_model = file_freq_model
+        self.freq_model: SparseAtomicGPR | None = (
+            _load_sparse_model(file_freq_model, device, allow_unsafe_load)
+            if file_freq_model is not None
+            else None
+        )
+        self.freq_extractor = ClusterExpansion(self.freq_model.config) if self.freq_model is not None else None
+
+    def reload_model(self, component: str, model_path: str) -> None:
+        """Hot-swap one component's checkpoint (slab/ads) after an
+        active-learning retraining cycle, without reconstructing the whole
+        evaluator/calculator."""
+        if component not in ("slab", "ads"):
+            raise ValueError(f"Unknown component {component!r}; expected 'slab' or 'ads'.")
+
+        model = _load_sparse_model(model_path, self.device, self.allow_unsafe_load)
+        setattr(self.calculator, f"{component}_model", model)
+        setattr(self.calculator, f"{component}_extractor", ClusterExpansion(model.config))
 
     def make_atoms(self, slab_atoms, occupation: np.ndarray):
         return build_adsorbed_structure(
@@ -1024,7 +950,7 @@ class CalculatorEnergyEvaluator:
         )
 
     def cutoffs(self) -> dict[str, float]:
-        return {"slab": float("nan"), "ads": float("nan"), "rep": float("nan")}
+        return {"slab": float("nan"), "ads": float("nan")}
 
     def initial_state(
         self,
@@ -1049,7 +975,6 @@ class CalculatorEnergyEvaluator:
             energy=energy,
             slab_k={},
             ads_k={},
-            rep_k={},
         )
 
     def local_update(
@@ -1073,31 +998,26 @@ class CalculatorEnergyEvaluator:
     def _evaluate_atoms(self, atoms, compute_uncertainty: bool = False) -> EnergyComponents:
         if compute_uncertainty:
             result = self.calculator.predict_energy_and_uncertainty(atoms)
-            slab_energy, total_energy, ads_energy, rep_energy, total_uncertainty, component_uncertainties = result[:6]
+            slab_energy, total_energy, ads_energy, total_uncertainty, component_uncertainties = result[:5]
             slab_unc = component_uncertainties.get("slab", float("nan"))
             ads_unc = component_uncertainties.get("ads", float("nan"))
-            rep_unc = component_uncertainties.get("rep", float("nan"))
             return EnergyComponents(
                 total=_scalar_to_float(total_energy, "total_energy"),
                 slab=_scalar_to_float(slab_energy, "slab_energy"),
                 ads=_scalar_to_float(ads_energy, "ads_energy"),
-                rep=_scalar_to_float(rep_energy, "rep_energy"),
                 uncertainty=_scalar_to_float(total_uncertainty, "total_uncertainty"),
                 uncertainty_slab=_scalar_to_float(slab_unc, "slab_uncertainty"),
                 uncertainty_ads=_scalar_to_float(ads_unc, "ads_uncertainty"),
-                uncertainty_rep=_scalar_to_float(rep_unc, "rep_uncertainty"),
             )
 
-        slab_energy, total_energy, ads_energy, rep_energy = self.calculator(atoms)
+        slab_energy, total_energy, ads_energy = self.calculator(atoms)
         return EnergyComponents(
             total=_scalar_to_float(total_energy, "total_energy"),
             slab=_scalar_to_float(slab_energy, "slab_energy"),
             ads=_scalar_to_float(ads_energy, "ads_energy"),
-            rep=_scalar_to_float(rep_energy, "rep_energy"),
             uncertainty=float("nan"),
             uncertainty_slab=float("nan"),
             uncertainty_ads=float("nan"),
-            uncertainty_rep=float("nan"),
         )
 
 
@@ -1113,8 +1033,8 @@ def _fmt_table_float(value: float, width: int = 12, precision: int = 5, scientif
 def progress_table_header() -> str:
     return (
         f"{'step':>8} "
-        f"{'E_total':>14} {'E_slab':>14} {'E_ads':>14} {'E_rep':>14} "
-        f"{'unc_tot':>12} {'unc_slab':>12} {'unc_ads':>12} {'unc_rep':>12} "
+        f"{'E_total':>14} {'E_slab':>14} {'E_ads':>14} "
+        f"{'unc_tot':>12} {'unc_slab':>12} {'unc_ads':>12} "
         f"{'N_CO':>5} {'theta':>8} "
         f"{'acc_alloy':>10} {'acc_CO':>8} {'acc_ins':>8} {'acc_del':>8} {'acc_mig':>8}"
     )
@@ -1139,11 +1059,9 @@ def progress_table_row(step: int, state: LocalMCState, coverage_denominator: int
         f"{_fmt_table_float(e.total, 14, 6)} "
         f"{_fmt_table_float(e.slab, 14, 6)} "
         f"{_fmt_table_float(e.ads, 14, 6)} "
-        f"{_fmt_table_float(e.rep, 14, 6)} "
         f"{_fmt_table_float(e.uncertainty, 12, 4, scientific=True)} "
         f"{_fmt_table_float(getattr(e, 'uncertainty_slab', float('nan')), 12, 4, scientific=True)} "
         f"{_fmt_table_float(getattr(e, 'uncertainty_ads', float('nan')), 12, 4, scientific=True)} "
-        f"{_fmt_table_float(getattr(e, 'uncertainty_rep', float('nan')), 12, 4, scientific=True)} "
         f"{n_co:5d} {theta:8.4f} "
         f"{_fmt_table_float(acc_alloy, 10, 3)} "
         f"{_fmt_table_float(acc_co, 8, 3)} "
@@ -1151,6 +1069,200 @@ def progress_table_row(step: int, state: LocalMCState, coverage_denominator: int
         f"{_fmt_table_float(acc_del, 8, 3)} "
         f"{_fmt_table_float(acc_mig, 8, 3)}"
     )
+
+
+class ActiveLearningController:
+    """Synchronous active-learning retraining loop.
+
+    When the running MC's slab/ads uncertainty exceeds the threshold
+    configured for that component, the whole MC run pauses: a DFT relaxation
+    is launched (blocking) via `run_script`, its result is folded into that
+    component's own ase.db, the corresponding SparseAtomicGPR is retrained
+    via ce_gpr_train.run(), and the freshly retrained checkpoint is hot
+    swapped into the running evaluator before MC resumes - see run_cycle.
+    """
+
+    COMPONENTS = ("slab", "ads")
+
+    def __init__(
+        self,
+        cfg: dict,
+        slab_model_path: str,
+        device: str = "cpu",
+        allow_unsafe_load: bool = False,
+    ):
+        self.thresholds = {
+            name: float(cfg.get("uncertainty_thresholds", {}).get(name, float("inf")))
+            for name in self.COMPONENTS
+        }
+        self.run_script = str(cfg["run_script"])
+        self.run_dir = Path(cfg.get("run_dir", "active_learning_runs"))
+        self.poscar_name = cfg.get("poscar_name", "in.poscar")
+        self.finished_marker = cfg.get("finished_marker", "final.traj")
+        self.energy_file = cfg.get("energy_file", "final.e")
+        self.datasets: dict[str, str] = dict(cfg["_datasets"])
+        self.train_configs: dict[str, str] = dict(cfg["train_configs"])
+        self.co_gas_outcar = cfg.get("co_gas_outcar")
+
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        # Resume numbering after whatever job_NNNNN dirs already exist (e.g.
+        # from a previous run against the same run_dir) instead of always
+        # starting at job_00001 and colliding with them.
+        self._counter = self._max_existing_job_number()
+        self._co_energy: float | None = None
+
+        # Own slab-only predictor, independent of whichever MC evaluator is
+        # running (Local or Calculator) - run_cycle needs a predicted E_slab
+        # for the freshly-relaxed (possibly alloy-mutated) DFT structure to
+        # compute e_ads_total, which isn't naturally something every
+        # evaluator variant exposes for an arbitrary (non-MC-site-aligned)
+        # atoms object. Kept in sync with the live evaluator via
+        # _sync_predictor below.
+        self._predictor = CalculatorCESparseGPR(
+            file_slab_model=slab_model_path,
+            device=device,
+            allow_unsafe_load=allow_unsafe_load,
+        )
+
+    def triggered_component(self, energy: EnergyComponents, n_co: int) -> str | None:
+        """Return the first component whose uncertainty exceeds its own
+        threshold, or None. ads needs at least one occupied site."""
+        n_co = int(n_co)
+        checks = (
+            ("slab", energy.uncertainty_slab),
+            ("ads", energy.uncertainty_ads if n_co >= 1 else float("nan")),
+        )
+        for name, value in checks:
+            if np.isfinite(value) and value > self.thresholds[name]:
+                return name
+        return None
+
+    def _co_gas_energy(self) -> float:
+        if self._co_energy is None:
+            import make_database as mdb
+
+            self._co_energy = (
+                mdb.load_co_gas_energy(self.co_gas_outcar)
+                if self.co_gas_outcar
+                else mdb.load_co_gas_energy()
+            )
+        return self._co_energy
+
+    def _max_existing_job_number(self) -> int:
+        max_n = 0
+        for path in self.run_dir.glob("job_*"):
+            try:
+                n = int(path.name.removeprefix("job_"))
+            except ValueError:
+                continue
+            max_n = max(max_n, n)
+        return max_n
+
+    def _run_dft(self, atoms) -> tuple:
+        """Write `atoms` as the run script's expected input, launch it
+        (blocking) in a fresh job directory, and return (relaxed_atoms,
+        energy) once it finishes."""
+        self._counter += 1
+        job_dir = self.run_dir / f"job_{self._counter:05d}"
+        job_dir.mkdir(parents=True, exist_ok=False)
+
+        write(str(job_dir / self.poscar_name), atoms, format="vasp")
+
+        print(f"[active learning] launching {self.run_script} in {job_dir} ...", flush=True)
+        result = subprocess.run(
+            [sys.executable, str(Path(self.run_script).resolve())],
+            cwd=str(job_dir),
+            capture_output=True,
+            text=True,
+        )
+        (job_dir / "run_stdout.log").write_text(result.stdout or "", encoding="utf-8")
+        (job_dir / "run_stderr.log").write_text(result.stderr or "", encoding="utf-8")
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"run.py failed in {job_dir} (exit code {result.returncode}). "
+                f"See {job_dir / 'run_stderr.log'}."
+            )
+
+        marker_path = job_dir / self.finished_marker
+        if not marker_path.exists():
+            raise RuntimeError(
+                f"run.py exited cleanly but {self.finished_marker!r} is missing in {job_dir}: "
+                "the relaxation did not actually finish."
+            )
+
+        relaxed_atoms = read(str(marker_path))
+        energy_path = job_dir / self.energy_file
+        if energy_path.exists():
+            energy = float(energy_path.read_text().strip())
+        else:
+            energy = float(relaxed_atoms.get_potential_energy())
+
+        print(f"[active learning] {job_dir}: DFT energy = {energy:.6f} eV", flush=True)
+        return relaxed_atoms, energy
+
+    def run_cycle(
+        self,
+        component: str,
+        evaluator: "CalculatorEnergyEvaluator",
+        state: "LocalMCState",
+    ) -> None:
+        import make_database as mdb
+
+        n_co = int(np.asarray(state.occupation, dtype=bool).sum())
+
+        if component == "slab":
+            # The slab model is trained on bare-alloy DFT points only - probe
+            # it at zero CO coverage regardless of the MC's current occupation.
+            atoms = evaluator.make_atoms(state.slab_atoms, np.zeros_like(state.occupation))
+            relaxed_atoms, energy = self._run_dft(atoms)
+            mdb.append_row_to_db(self.datasets["slab"], relaxed_atoms, energy)
+
+        else:
+            atoms = evaluator.make_atoms(state.slab_atoms, state.occupation)
+            relaxed_atoms, energy = self._run_dft(atoms)
+
+            # This controller's OWN predictor (kept in sync via
+            # _sync_predictor, independent of the running MC evaluator) -
+            # same formula as compute_e_ads_total_exact, but with a
+            # MODEL-predicted E_slab (this alloy's exact clean-slab DFT
+            # energy isn't available mid-MC, unlike in dataset construction).
+            slab_energy, _, _ = self._predictor(relaxed_atoms)
+            slab_energy = float(slab_energy.item())
+            co_energy = self._co_gas_energy()
+
+            e_ads_total = energy - (slab_energy + n_co * co_energy)
+            mdb.append_row_to_db(
+                self.datasets["ads"], relaxed_atoms, energy, n_co=n_co, e_ads_total=e_ads_total
+            )
+
+        print(f"[active learning] retraining {component} model ...", flush=True)
+        # On this train_config's very first cycle (its own output.dir has no
+        # checkpoint yet), let warm_start bootstrap from whatever model the
+        # running MC evaluator was ACTUALLY deployed with, instead of cold-
+        # starting from the config's init_lengthscale/"auto" - see
+        # resolve_warm_start's fallback_checkpoint_path docstring.
+        live_model_path = getattr(evaluator, f"file_{component}_model", None)
+        # save_plot=False: skip writing the parity PDF - each call spawns a
+        # fresh kaleido (headless-Chromium) subprocess for fig.write_image,
+        # and repeated calls across many AL retraining cycles in this same
+        # long-lived process have been observed to eventually hang.
+        _, new_model_path = ce_gpr_train.run(
+            self.train_configs[component], warm_start_fallback=live_model_path, save_plot=False
+        )
+        print(f"[active learning] retrained {component} model -> {new_model_path}", flush=True)
+        evaluator.reload_model(component, str(new_model_path))
+        self._sync_predictor(component, str(new_model_path))
+
+    def _sync_predictor(self, component: str, model_path: str) -> None:
+        """Keep this controller's own predictor in step with a component
+        that was just retrained (slab only - self._predictor never carries
+        an ads model, since its own e_ads_total formula never needs one)."""
+        if component != "slab":
+            return
+        model = _load_sparse_model(model_path, self._predictor.device or "cpu", self._predictor.allow_unsafe_load)
+        setattr(self._predictor, "slab_model", model)
+        setattr(self._predictor, "slab_extractor", ClusterExpansion(model.config))
 
 
 class GrandCO_MC:
@@ -1164,9 +1276,7 @@ class GrandCO_MC:
         min_co_distance: float,
         rng: np.random.Generator,
         *,
-        active_learning: bool = False,
-        uncertainty_threshold: float = float("inf"),
-        active_learning_trajectory: str | None = None,
+        active_learning: ActiveLearningController | None = None,
         initial_occupation: np.ndarray | None = None,
         layer_ids: np.ndarray | None = None,
         frozen_atom_mask: np.ndarray | None = None,
@@ -1183,12 +1293,7 @@ class GrandCO_MC:
         self.delta_mu = finite_float(delta_mu, "delta_mu")
         self.min_co_distance = nonnegative_float(min_co_distance, "min_co_distance")
         self.rng = rng
-        self.active_learning = bool(active_learning)
-        self.uncertainty_threshold = float(uncertainty_threshold)
-        if np.isnan(self.uncertainty_threshold):
-            raise ValueError("uncertainty_threshold must not be NaN.")
-        self.active_learning_trajectory = active_learning_trajectory
-        self.active_learning_count = 0
+        self.active_learning = active_learning
 
         self.slab_atoms = slab_atoms.copy()
 
@@ -1226,7 +1331,7 @@ class GrandCO_MC:
         return self.evaluator.initial_state(
             self.slab_atoms,
             occupation=self.initial_occupation,
-            compute_uncertainty=self.active_learning,
+            compute_uncertainty=True,
         )
 
     def make_atoms(self, state: LocalMCState):
@@ -1244,37 +1349,36 @@ class GrandCO_MC:
         )
         return nearest >= self.min_co_distance
 
-    def maybe_export_active_learning_candidate(self, state: LocalMCState) -> None:
-        if not self.active_learning:
-            return
-        uncertainty = float(getattr(state.energy, "uncertainty", float("nan")))
-        if not np.isfinite(uncertainty) or uncertainty < self.uncertainty_threshold:
-            return
-        if self.active_learning_trajectory in (None, ""):
-            raise RuntimeError("active_learning_trajectory is empty.")
+    def _maybe_retrain(self, state: LocalMCState, candidate: LocalMCState) -> tuple[LocalMCState, LocalMCState]:
+        """If `candidate`'s uncertainty trips a configured threshold, pause
+        for a full active-learning cycle (DFT -> db -> retrain -> hot swap),
+        then re-evaluate BOTH state and candidate from scratch under the
+        (possibly now different) models, so the Metropolis test right after
+        this compares energies computed with the same model generation."""
+        if self.active_learning is None:
+            return state, candidate
 
-        atoms_out = attach_mc_info(
-            self.make_atoms(state),
-            energy=state.energy,
-            occupation=state.occupation,
-            av_comp=None,
-            layer_ids=self.layer_ids,
-            frozen_atom_mask=self.frozen_atom_mask,
-            coverage_denominator=self.coverage_denominator,
+        n_co = int(np.asarray(candidate.occupation, dtype=bool).sum())
+        component = self.active_learning.triggered_component(candidate.energy, n_co=n_co)
+        if component is None:
+            return state, candidate
+
+        triggering_unc = getattr(candidate.energy, f"uncertainty_{component}")
+        threshold = self.active_learning.thresholds[component]
+        print(
+            f"[active learning] triggered by component={component!r}: "
+            f"uncertainty={triggering_unc:.6f} > threshold={threshold:.6f} "
+            f"(N_CO={n_co}, on a PROPOSED candidate move - may or may not end up accepted)",
+            flush=True,
         )
-        atoms_out.info["active_learning_uncertainty"] = uncertainty
-        atoms_out.info["active_learning_uncertainty_slab"] = float(getattr(state.energy, "uncertainty_slab", float("nan")))
-        atoms_out.info["active_learning_uncertainty_ads"] = float(getattr(state.energy, "uncertainty_ads", float("nan")))
-        atoms_out.info["active_learning_uncertainty_rep"] = float(getattr(state.energy, "uncertainty_rep", float("nan")))
-        atoms_out.info["active_learning_index"] = self.active_learning_count
-        _ensure_parent_dir(self.active_learning_trajectory)
-        mode = "a" if self.active_learning_count > 0 else "w"
-        traj = Trajectory(self.active_learning_trajectory, mode)
-        try:
-            traj.write(atoms_out)
-        finally:
-            traj.close()
-        self.active_learning_count += 1
+
+        self.active_learning.run_cycle(component, self.evaluator, candidate)
+
+        state = self.evaluator.full_rebuild(state.slab_atoms, state.occupation, compute_uncertainty=True)
+        candidate = self.evaluator.full_rebuild(
+            candidate.slab_atoms, candidate.occupation, compute_uncertainty=True
+        )
+        return state, candidate
 
     def attempt_alloy_swap(self, state: LocalMCState) -> LocalMCState:
         self.stats.alloy_attempts += 1
@@ -1292,9 +1396,9 @@ class GrandCO_MC:
             candidate_occupation=state.occupation,
             changed_metal_indices=pair,
             changed_site_ids=(),
-            compute_uncertainty=self.active_learning,
+            compute_uncertainty=True,
         )
-        self.maybe_export_active_learning_candidate(candidate)
+        state, candidate = self._maybe_retrain(state, candidate)
 
         d_omega = candidate.energy.total - state.energy.total
         if metropolis_hastings_accept(d_omega, beta=self.beta, log_q_reverse_over_forward=0.0, rng=self.rng):
@@ -1365,9 +1469,9 @@ class GrandCO_MC:
             candidate_occupation=candidate_occ,
             changed_metal_indices=(),
             changed_site_ids=changed_sites,
-            compute_uncertainty=self.active_learning,
+            compute_uncertainty=True,
         )
-        self.maybe_export_active_learning_candidate(candidate)
+        state, candidate = self._maybe_retrain(state, candidate)
 
         dE = candidate.energy.total - state.energy.total
         dOmega = dE - self.delta_mu * delta_n
@@ -1414,8 +1518,6 @@ class GrandCO_MC:
         self,
         state: LocalMCState,
         nsteps: int,
-        alloy_attempts_per_step: int,
-        co_attempts_per_step: int,
         print_every: int,
         write_every: int,
         trajectory: str,
@@ -1424,18 +1526,14 @@ class GrandCO_MC:
             _ensure_parent_dir(trajectory)
             if os.path.exists(trajectory):
                 os.remove(trajectory)
-        if self.active_learning and self.active_learning_trajectory and os.path.exists(self.active_learning_trajectory):
-            os.remove(self.active_learning_trajectory)
 
         self.accumulate_composition(state)
         if trajectory:
             write(trajectory, self.current_atoms_with_info(state, include_av_comp=True), format="extxyz", append=False)
 
         for step in range(1, int(nsteps) + 1):
-            for _ in range(int(alloy_attempts_per_step)):
-                state = self.attempt_alloy_swap(state)
-            for _ in range(int(co_attempts_per_step)):
-                state = self.attempt_co_move(state)
+            state = self.attempt_alloy_swap(state)
+            state = self.attempt_co_move(state)
 
             self.accumulate_composition(state)
 
@@ -1454,15 +1552,30 @@ class GrandCO_MC:
 
 
 def main() -> None:
-    args = parse_args()
+    cli_parser = argparse.ArgumentParser(
+        description=(
+            "Serial Metropolis MC for Pt/Pd + semi-grand-canonical CO, driven by a "
+            "single JSON config (see mc_grand.example.json). Evaluates trial moves via "
+            "an incremental local-descriptor cache by default (evaluator_mode='local'); "
+            "pass evaluator_mode='calculator' to instead rebuild the full descriptor "
+            "through CalculatorCESparseGPR on every move (slower, useful as a "
+            "correctness reference)."
+        )
+    )
+    cli_parser.add_argument("config", help="Path to a JSON config file.")
+    cli_args = cli_parser.parse_args()
+
+    cfg = load_config(cli_args.config)
+    args = namespace_from_config(cfg)
     validate_args(args)
+    al_cfg = cfg.get("active_learning")
+    validate_active_learning_config(al_cfg)
+
     _safe_set_torch_threads(1)
     rng = np.random.default_rng(args.seed)
 
     _ensure_parent_dir(args.trajectory)
     _ensure_parent_dir(args.output)
-    if args.active_learning:
-        _ensure_parent_dir(args.active_learning_trajectory)
 
     slab_atoms, input_atoms = load_or_build_slab(args)
 
@@ -1510,10 +1623,11 @@ def main() -> None:
     else:
         print("Initial CO occupation: N_CO = 0", flush=True)
 
-    evaluator = CalculatorEnergyEvaluator(
+    evaluator_cls = LocalDescriptorEnergyEvaluator if args.evaluator_mode == "local" else CalculatorEnergyEvaluator
+    evaluator = evaluator_cls(
         file_slab_model=args.slab_model,
         file_ads_model=args.ads_model,
-        file_rep_model=args.rep_model,
+        file_freq_model=args.freq_model,
         sites=sites,
         co_bond=args.co_bond,
         device=args.device,
@@ -1527,12 +1641,27 @@ def main() -> None:
             flush=True,
         )
     else:
-        rep_cutoff_text = "lazy/not loaded" if not np.isfinite(cutoffs["rep"]) else f"{cutoffs['rep']:.6f} A"
         print(
             "effective local descriptor invalidation cutoffs: "
             f"slab={cutoffs['slab']:.6f} A, "
-            f"ads={cutoffs['ads']:.6f} A, "
-            f"rep={rep_cutoff_text}",
+            f"ads={cutoffs['ads']:.6f} A",
+            flush=True,
+        )
+
+    active_learning = (
+        ActiveLearningController(
+            al_cfg,
+            slab_model_path=args.slab_model,
+            device=args.device,
+            allow_unsafe_load=args.allow_unsafe_model_load,
+        )
+        if al_cfg and al_cfg.get("enabled", False)
+        else None
+    )
+    if active_learning is not None:
+        print(
+            "active learning: enabled, uncertainty thresholds = "
+            f"{active_learning.thresholds}",
             flush=True,
         )
 
@@ -1544,9 +1673,7 @@ def main() -> None:
         delta_mu=args.delta_mu,
         min_co_distance=args.min_co_distance,
         rng=rng,
-        active_learning=args.active_learning,
-        uncertainty_threshold=args.uncertainty_threshold,
-        active_learning_trajectory=args.active_learning_trajectory,
+        active_learning=active_learning,
         initial_occupation=initial_occupation,
         layer_ids=layer_ids,
         frozen_atom_mask=frozen_atom_mask,
@@ -1564,8 +1691,6 @@ def main() -> None:
     final_state = mc.run(
         state=state,
         nsteps=args.nsteps,
-        alloy_attempts_per_step=args.alloy_attempts_per_step,
-        co_attempts_per_step=args.co_attempts_per_step,
         print_every=args.print_every,
         write_every=args.write_every,
         trajectory=args.trajectory,
@@ -1583,8 +1708,6 @@ def main() -> None:
     print(f"CO deletion acceptance = {mc.stats.co_delete_acceptance:.6f}", flush=True)
     print(f"CO migration acceptance = {mc.stats.co_migration_acceptance:.6f}", flush=True)
     print(f"Composition samples used for av_comp = {mc.av_comp_count}", flush=True)
-    if args.active_learning:
-        print(f"Active-learning structures written = {mc.active_learning_count}", flush=True)
 
 
 if __name__ == "__main__":

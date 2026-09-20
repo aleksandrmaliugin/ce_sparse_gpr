@@ -1,6 +1,6 @@
 from .ce_config import CEConfig, normalize_mask
 from .ce_extractor import ClusterExpansion
-from .dataset import CEDataset, atoms_near_carbon, calc_mindist
+from .dataset import CEDataset, atoms_near_carbon, calc_mindist, find_linearly_dependent_descriptors
 from .gpr import SparseAtomicGPR
 from .calculator import CalculatorCESparseGPR
 from .train import split_dataset, train, get_tensors_from_subset
@@ -13,6 +13,7 @@ __all__ = [
     "CEDataset",
     "atoms_near_carbon",
     "calc_mindist",
+    "find_linearly_dependent_descriptors",
     "SparseAtomicGPR",
     "CalculatorCESparseGPR",
     "split_dataset",

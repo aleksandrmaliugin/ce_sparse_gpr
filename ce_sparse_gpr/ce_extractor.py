@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from itertools import combinations, combinations_with_replacement
+from itertools import combinations_with_replacement
 from typing import Iterable
 import warnings
 
@@ -323,23 +323,21 @@ class ClusterExpansion:
         max_rmax = max(rmax for _, rmax in self.shells.values())
         i_arr, j_arr, S_arr, d_arr = neighbor_list("ijSd", atoms, max_rmax)
 
-        for i, j, S, d in zip(i_arr, j_arr, S_arr, d_arr):
-            i = int(i)
-            j = int(j)
-            d = float(d)
+        # Vectorized shell assignment: filter self-pairs once, then mask per shell.
+        valid = i_arr != j_arr
+        i_v, j_v, S_v, d_v = i_arr[valid], j_arr[valid], S_arr[valid], d_arr[valid]
 
-            if i == j:
+        for shell_name, (rmin, rmax) in self.shells.items():
+            mask = (d_v >= rmin) & (d_v < rmax)
+            if not np.any(mask):
                 continue
-
-            S_tuple = tuple(int(x) for x in S)
-
-            for shell_name, (rmin, rmax) in self.shells.items():
-                if rmin <= d < rmax:
-                    pair_clusters[shell_name].append((i, j, S_tuple, d))
-                    break
-
-        for shell_name in pair_clusters:
-            pair_clusters[shell_name].sort(key=lambda x: (x[0], x[1], x[2]))
+            idx = np.where(mask)[0]
+            pairs = [
+                (int(i_v[k]), int(j_v[k]), (int(S_v[k, 0]), int(S_v[k, 1]), int(S_v[k, 2])), float(d_v[k]))
+                for k in idx
+            ]
+            pairs.sort(key=lambda x: (x[0], x[1], x[2]))
+            pair_clusters[shell_name] = pairs
 
         return pair_clusters
 
@@ -367,30 +365,71 @@ class ClusterExpansion:
         return float(np.linalg.norm(rj - rk))
 
     def _build_triplet_clusters(self, atoms: ase.Atoms, pair_clusters: dict):
-        triplet_clusters = {}
         shell_names = list(self.shells.keys())
+        shell_items = list(self.shells.items())
+
+        triplet_clusters = {
+            f"trip_hips_{hips_name}_base_{base_name}": []
+            for hips_name in shell_names
+            for base_name in shell_names
+        }
+
+        # Fetch positions and cell once instead of once per neighbor pair.
+        positions = atoms.get_positions()
+        cell = np.asarray(atoms.get_cell())
 
         for hips_name in shell_names:
             hips_pairs = pair_clusters.get(hips_name, [])
+            if not hips_pairs:
+                # Nothing centered in this shell - skip straight to the next
+                # hips_name instead of paying for len(shells) empty base_name
+                # buckets below. With len(shells) large (e.g. 33 for the rep
+                # descriptor) and few requested centers (the common case for
+                # a local/incremental MC descriptor update), most hips_name
+                # buckets ARE empty, so this alone skips most of the work.
+                continue
             neigh = self.pairlist_to_center_dict(hips_pairs)
 
-            for base_name in shell_names:
-                base_rmin, base_rmax = self.shells[base_name]
-                triplet_name = f"trip_hips_{hips_name}_base_{base_name}"
-                triplets = []
+            for center, nbrs in neigh.items():
+                n = len(nbrs)
+                if n < 2:
+                    continue
 
-                for center, nbrs in neigh.items():
-                    for (j, Sj, _), (k, Sk, _) in combinations(nbrs, 2):
-                        d_jk = self.image_distance(atoms, j, Sj, k, Sk)
+                # Precompute periodic image positions for all neighbors at once.
+                j_ids = np.fromiter((j for j, _, _ in nbrs), dtype=int, count=n)
+                S_nbrs = np.array([Sj for _, Sj, _ in nbrs], dtype=float)
+                pos_imgs = positions[j_ids] + S_nbrs @ cell  # (n, 3)
 
-                        if base_rmin <= d_jk < base_rmax:
-                            if (j, Sj) <= (k, Sk):
-                                triplets.append((center, j, Sj, k, Sk))
-                            else:
-                                triplets.append((center, k, Sk, j, Sj))
+                # All pairwise distances in one vectorized operation - computed
+                # ONCE per (hips_name, center), not once per base_name: the
+                # distance matrix itself doesn't depend on base_name at all,
+                # only which shell bucket each pair lands in does. The old
+                # code recomputed this same (n, n) matrix len(shells) times
+                # (33x for the rep descriptor) inside a "for base_name" loop
+                # that only ever used it to re-run the same classification
+                # with a different acceptance window.
+                diff = pos_imgs[:, None, :] - pos_imgs[None, :, :]  # (n, n, 3)
+                d_mat = np.sqrt((diff ** 2).sum(axis=-1))            # (n, n)
 
-                triplets.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4]))
-                triplet_clusters[triplet_name] = triplets
+                for a in range(n):
+                    j, Sj, _ = nbrs[a]
+                    for b in range(a + 1, n):
+                        k, Sk, _ = nbrs[b]
+                        d_ab = d_mat[a, b]
+                        # Shells are contiguous, non-overlapping windows (see
+                        # CEConfig._build_shells_dict), so a distance falls in
+                        # at most one - stop at the first match.
+                        for base_name, (base_rmin, base_rmax) in shell_items:
+                            if base_rmin <= d_ab < base_rmax:
+                                triplet_name = f"trip_hips_{hips_name}_base_{base_name}"
+                                if (j, Sj) <= (k, Sk):
+                                    triplet_clusters[triplet_name].append((center, j, Sj, k, Sk))
+                                else:
+                                    triplet_clusters[triplet_name].append((center, k, Sk, j, Sj))
+                                break
+
+        for triplets in triplet_clusters.values():
+            triplets.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4]))
 
         return triplet_clusters
 
@@ -426,19 +465,22 @@ class ClusterExpansion:
 
         return geom_types
 
-    def count_descriptors_atomic(
-        self,
-        elements_list: list[str],
-        clusters: dict,
-        atom_indices: list[int] | None = None,
-    ) -> tuple[np.ndarray, list[str], list[str]]:
-        n_atoms = len(elements_list)
-        selected_centers = set(atom_indices) if atom_indices is not None else None
+    def _geom_type_label_cache(self) -> dict:
+        """Per-geom_type (compact_labels, label_to_col, descriptor_keys,
+        descriptor_names) - a pure function of self.config (elements, shells,
+        max_order), never of the atoms/clusters passed to
+        count_descriptors_atomic. Recomputing this on every single descriptor
+        extraction call (as count_descriptors_atomic used to) means
+        re-running chemical_labels_atomic(_display) and re-formatting a
+        display-name string for every one of len(shells)^2 triplet geom_types
+        - 1089 of them for a 33-shell config - on every MC step, even though
+        the result never changes for the lifetime of this ClusterExpansion.
+        Cached once per instance instead."""
+        cache = getattr(self, "_geom_type_labels_cache", None)
+        if cache is not None:
+            return cache
 
-        descriptor_names: list[str] = []
-        descriptor_keys: list[str] = []
-        blocks: list[np.ndarray] = []
-
+        cache = {}
         for geom_type in self.ordered_geom_types():
             if geom_type == "singles":
                 order = 1
@@ -450,7 +492,55 @@ class ClusterExpansion:
             compact_labels = self.chemical_labels_atomic(order)
             display_labels = self.chemical_labels_atomic_display(order)
             label_to_col = {label: i for i, label in enumerate(compact_labels)}
-            block = np.zeros((n_atoms, len(compact_labels)), dtype=float)
+            descriptor_keys = [self._descriptor_key(geom_type, label) for label in compact_labels]
+            descriptor_names = [
+                self._descriptor_display_name(geom_type, label) for label in display_labels
+            ]
+            cache[geom_type] = (compact_labels, label_to_col, descriptor_keys, descriptor_names)
+
+        self._geom_type_labels_cache = cache
+        return cache
+
+    def count_descriptors_atomic(
+        self,
+        elements_list: list[str],
+        clusters: dict,
+        atom_indices: list[int] | None = None,
+    ) -> tuple[np.ndarray, list[str], list[str]]:
+        # atom_indices is None: unchanged full-structure behavior - one row
+        # per atom 0..n_atoms-1, block[center, col] indexed by global center.
+        #
+        # atom_indices given (the local/incremental MC path): allocate blocks
+        # sized to only the UNIQUE queried centers, not all n_atoms atoms.
+        # Every geom_type gets its own (n_atoms, D) zero block regardless of
+        # whether clusters[geom_type] is empty - for the rep descriptor
+        # (33 shells, max_order=3) that's 1057 geom_types, so a local update
+        # querying e.g. 2 atoms out of 384 was still paying for 1057 arrays
+        # of 384 rows each, ~99.5% of which could never be written to.
+        # Verified bit-identical to the old always-n_atoms-rows behavior
+        # (after generate_all_descriptors's gather-by-atom_indices below).
+        n_atoms = len(elements_list)
+        if atom_indices is None:
+            local_row = None
+            n_rows = n_atoms
+            selected_centers = None
+        else:
+            unique_indices = sorted(set(int(i) for i in atom_indices))
+            local_row = {g: r for r, g in enumerate(unique_indices)}
+            n_rows = len(unique_indices)
+            selected_centers = set(unique_indices)
+
+        label_cache = self._geom_type_label_cache()
+
+        descriptor_names: list[str] = []
+        descriptor_keys: list[str] = []
+        blocks: list[np.ndarray] = []
+
+        for geom_type in self.ordered_geom_types():
+            compact_labels, label_to_col, geom_descriptor_keys, geom_descriptor_names = label_cache[
+                geom_type
+            ]
+            block = np.zeros((n_rows, len(compact_labels)), dtype=float)
 
             for cluster in clusters.get(geom_type, []):
                 if geom_type == "singles":
@@ -481,18 +571,14 @@ class ClusterExpansion:
                         f"type '{geom_type}'. Allowed labels: {compact_labels}."
                     ) from exc
 
-                block[center, col] += 1.0
+                row = center if local_row is None else local_row[center]
+                block[row, col] += 1.0
 
             blocks.append(block)
-            descriptor_keys.extend(
-                self._descriptor_key(geom_type, label) for label in compact_labels
-            )
-            descriptor_names.extend(
-                self._descriptor_display_name(geom_type, label)
-                for label in display_labels
-            )
+            descriptor_keys.extend(geom_descriptor_keys)
+            descriptor_names.extend(geom_descriptor_names)
 
-        descriptor = np.concatenate(blocks, axis=1) if blocks else np.empty((n_atoms, 0))
+        descriptor = np.concatenate(blocks, axis=1) if blocks else np.empty((n_rows, 0))
         return descriptor, descriptor_names, descriptor_keys
 
     def build_clusters_local(self, atoms: ase.Atoms, atom_indices: list[int]):
@@ -561,6 +647,11 @@ class ClusterExpansion:
         atom_indices = self._as_index_list(atom_indices)
         elements_list = self._validate_atoms(atoms, atom_indices)
 
+        # Dedup/sort once here and reuse for both count_descriptors_atomic's
+        # row indexing and the final gather below, instead of recomputing
+        # sorted(set(atom_indices)) redundantly in each place.
+        unique_indices = None if atom_indices is None else sorted(set(int(i) for i in atom_indices))
+
         if atom_indices is None:
             clusters = self.build_clusters(atoms)
         else:
@@ -569,14 +660,20 @@ class ClusterExpansion:
         descriptor, descriptor_names, descriptor_keys = self.count_descriptors_atomic(
             elements_list=elements_list,
             clusters=clusters,
-            atom_indices=atom_indices,
+            atom_indices=unique_indices,
         )
 
         self.full_descriptor_names = list(descriptor_names)
         self.full_descriptor_keys = list(descriptor_keys)
 
         if atom_indices is not None:
-            descriptor = descriptor[atom_indices]
+            # count_descriptors_atomic returns one row per UNIQUE queried
+            # center (sorted, since that's what it was given above) - gather
+            # (with repeats, in the caller's original order) back to match
+            # atom_indices exactly, same contract as the old
+            # `descriptor[atom_indices]` full-row slice.
+            row_of = {g: r for r, g in enumerate(unique_indices)}
+            descriptor = descriptor[[row_of[int(i)] for i in atom_indices]]
 
         if apply_mask:
             descriptor = self.apply_descriptor_mask(

@@ -1,0 +1,77 @@
+{
+  "seed": 42,
+  "device": "cpu",
+  "dtype": "float64",
+  "dataset": {
+    "db_path": "datasets/ads.db",
+    "target_y": "e_ads_total"
+  },
+  "test_dataset": {
+    "db_path": null,
+    "target_y": "e_ads_total"
+  },
+  "descriptor": {
+    "elements": [
+      "C",
+      "Pt",
+      "Pd"
+    ],
+    "max_order": 2,
+    "mindist": 1.1500000000000004,
+    "shells": [
+      0.0,
+      1.562,
+      1.7933,
+      2.1522,
+      2.5951,
+      2.7788,
+      2.9453,
+      3.2142,
+      3.4106,
+      3.5189,
+      3.624,
+      3.8044,
+      4.0427,
+      4.4895,
+      4.939,
+      5.0517,
+      5.2672,
+      5.508,
+      6.011
+    ],
+    "atom_indices": {
+      "source": "carbon_atoms",
+      "aggregate": false
+    }
+  },
+  "model": {
+    "M": 450,
+    "div": 0.01,
+    "init_lengthscale": "auto",
+    "init_sigma2": 0.001,
+    "init_outputscale": 1.0,
+    "jitter": 1e-10,
+    "mean_function": "linear"
+  },
+  "training": {
+    "method": "kfold_lbfgs",
+    "select_by_rmse_per_co": true,
+    "lbfgs": {
+      "n_steps": 1000,
+      "max_iter": 20,
+      "lr": 0.1,
+      "early_stop_patience": 20,
+      "loss_tol": 0.5
+    },
+    "kfold": {
+      "n_splits": 5,
+      "shuffle": true,
+      "seed": 42
+    }
+  },
+  "output": {
+    "dir": "models/ads",
+    "model_filename": "model.pt",
+    "plot_filename": "accuracy.pdf"
+  }
+}

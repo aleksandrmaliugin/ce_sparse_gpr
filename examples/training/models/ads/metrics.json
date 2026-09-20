@@ -1,0 +1,12 @@
+{
+  "rmse_train": 0.024005226344437056,
+  "rmse_valid": 0.043417581702811736,
+  "mae_train": 0.014985695850394332,
+  "mae_valid": 0.026112516427612607,
+  "rmse_train_per_co": 0.011545933544031784,
+  "mae_train_per_co": 0.008019953971176288,
+  "rmse_valid_per_co": 0.013336773379051634,
+  "mae_valid_per_co": 0.009983167560934503,
+  "best_model_path": "models\\ads\\model_fold_4.pt",
+  "best_model_copy_path": "models\\ads\\model_best.pt"
+}

@@ -1,0 +1,8 @@
+{
+  "rmse_train": 0.023803211423275853,
+  "rmse_valid": 0.027239319498179673,
+  "mae_train": 0.01805355938455091,
+  "mae_valid": 0.020546757985400177,
+  "best_model_path": "models\\clean\\model_fold_1.pt",
+  "best_model_copy_path": "models\\clean\\model_best.pt"
+}

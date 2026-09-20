@@ -46,22 +46,33 @@ class AdsorptionSite:
 
 @dataclass
 class EnergyComponents:
+    """total = slab + ads + freq.
+
+    "ads" is the single per-CO adsorption model (additive across every
+    occupied site, one descriptor row per carbon atom) - it covers both the
+    base adsorption energy AND CO-CO lateral interactions in one model, since
+    those used to be two separate components (ads + rep) fit to two separate
+    descriptor styles, before the rep-style ("carbon_atoms", additive, no
+    minimum-coverage gate) descriptor was found to subsume the old ads-style
+    one (metal-centered, aggregated per site) entirely - see ads_unified.
+    """
+
     total: float
     slab: float
     ads: float
-    rep: float
+    freq: float = 0.0
     uncertainty: float = float("nan")
     uncertainty_slab: float = float("nan")
     uncertainty_ads: float = float("nan")
-    uncertainty_rep: float = float("nan")
+    uncertainty_freq: float = float("nan")
 
     def __post_init__(self) -> None:
         self.total = finite_float(self.total, "total")
         self.slab = finite_float(self.slab, "slab")
         self.ads = finite_float(self.ads, "ads")
-        self.rep = finite_float(self.rep, "rep")
+        self.freq = finite_float(self.freq, "freq")
 
-        for name in ("uncertainty", "uncertainty_slab", "uncertainty_ads", "uncertainty_rep"):
+        for name in ("uncertainty", "uncertainty_slab", "uncertainty_ads", "uncertainty_freq"):
             value = float(getattr(self, name))
             if not (np.isfinite(value) or np.isnan(value)):
                 raise ValueError(f"{name} must be finite or NaN, got {value}.")
@@ -626,11 +637,11 @@ def attach_mc_info(
     atoms.info["E_total"] = float(energy.total)
     atoms.info["E_slab"] = float(energy.slab)
     atoms.info["E_ads"] = float(energy.ads)
-    atoms.info["E_rep"] = float(energy.rep)
+    atoms.info["E_freq"] = float(getattr(energy, "freq", 0.0))
     atoms.info["uncertainty"] = float(getattr(energy, "uncertainty", float("nan")))
     atoms.info["uncertainty_slab"] = float(getattr(energy, "uncertainty_slab", float("nan")))
     atoms.info["uncertainty_ads"] = float(getattr(energy, "uncertainty_ads", float("nan")))
-    atoms.info["uncertainty_rep"] = float(getattr(energy, "uncertainty_rep", float("nan")))
+    atoms.info["uncertainty_freq"] = float(getattr(energy, "uncertainty_freq", float("nan")))
     atoms.info["N_CO"] = n_co
     atoms.info["N_adsorption_sites"] = n_sites
     atoms.info["coverage_denominator"] = coverage_denominator

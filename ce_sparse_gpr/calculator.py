@@ -17,14 +17,21 @@ class CalculatorCESparseGPR:
     """
     Energy and uncertainty calculator for CE-descriptor sparse GPR models.
 
-    E_total = E_slab + E_ads + E_rep
+    E_total = E_slab + E_ads
+
+    "ads" is the single per-CO adsorption model: one descriptor row per
+    carbon atom (the "carbon_atoms" / additive style), summed across every
+    adsorbed CO - it covers the base adsorption energy AND CO-CO lateral
+    interactions together (see ads_unified/e_ads_total), which used to be
+    two separate models/components (ads + rep) built from two different
+    descriptor styles before the rep-style one was found to subsume the
+    ads-style one entirely.
     """
 
     def __init__(
         self,
         file_slab_model: str | Path | None = None,
         file_ads_model: str | Path | None = None,
-        file_rep_model: str | Path | None = None,
         device=None,
         dtype: torch.dtype = torch.float64,
         allow_unsafe_load: bool = False,
@@ -37,11 +44,9 @@ class CalculatorCESparseGPR:
 
         self.slab_model = self._load_optional_model(file_slab_model, **load_kwargs)
         self.ads_model = self._load_optional_model(file_ads_model, **load_kwargs)
-        self.rep_model = self._load_optional_model(file_rep_model, **load_kwargs)
 
         self.slab_extractor = self._make_optional_extractor(self.slab_model)
         self.ads_extractor = self._make_optional_extractor(self.ads_model)
-        self.rep_extractor = self._make_optional_extractor(self.rep_model)
 
     def _load_optional_model(self, model_path, **load_kwargs) -> SparseAtomicGPR | None:
         if model_path is None:
@@ -201,54 +206,30 @@ class CalculatorCESparseGPR:
 
         return np.asarray(atom_indices, dtype=int), np.asarray(carbon_indices, dtype=int), labels_per_atom
 
-    def _adsorption_site_descriptors(self, atoms: ase.Atoms):
+    def _ads_descriptors(self, atoms: ase.Atoms):
+        """One descriptor row per carbon atom (additive across every
+        adsorbed CO) - contributes starting at n_co=1, since this single
+        model now carries the whole adsorption+interaction energy (see the
+        class docstring)."""
         if self.ads_model is None or self.ads_extractor is None:
-            return None, np.array([], dtype=int), np.array([], dtype=int)
+            return None, np.array([], dtype=int)
 
-        atom_indices, carbon_indices, labels_per_atom = self._co_indices(atoms)
-        if len(carbon_indices) == 0 or len(atom_indices) == 0:
-            return None, carbon_indices, np.array([], dtype=int)
+        _, carbon_indices, _ = self._co_indices(atoms)
+        if len(carbon_indices) == 0:
+            return None, carbon_indices
 
-        compatible = self._selected_indices_compatible_with_model(atoms, atom_indices, self.ads_model)
+        compatible = self._selected_indices_compatible_with_model(atoms, carbon_indices, self.ads_model)
         if len(compatible) == 0:
-            return None, carbon_indices, np.array([], dtype=int)
+            return None, carbon_indices
 
-        compatible_set = set(int(i) for i in compatible)
-        filtered_labels = [
-            labels for idx, labels in zip(atom_indices, labels_per_atom) if int(idx) in compatible_set
-        ]
-
-        ads_desc = self.ads_extractor(atoms, atom_indices=compatible)
-        ads_desc = self._as_tensor(ads_desc)
-
-        x_site, site_labels = aggregate_multi_label_descriptors(
-            x=ads_desc,
-            labels_per_atom=filtered_labels,
-        )
-
-        if x_site.shape[0] == 0:
-            return None, carbon_indices, site_labels
-
-        return x_site.detach().cpu().numpy(), carbon_indices, site_labels
-
-    def _repulsion_descriptors(self, atoms: ase.Atoms, carbon_indices: np.ndarray):
-        if self.rep_model is None or self.rep_extractor is None:
-            return None
-        if len(carbon_indices) <= 1:
-            return None
-
-        compatible = self._selected_indices_compatible_with_model(atoms, carbon_indices, self.rep_model)
-        if len(compatible) == 0:
-            return None
-
-        return self.rep_extractor(atoms, atom_indices=compatible)
+        return self.ads_extractor(atoms, atom_indices=compatible), carbon_indices
 
     def _evaluate_components(
         self,
         atoms: ase.Atoms,
         compute_uncertainty: bool,
         uncertainty_mode: str = "quadrature",
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor], dict[str, bool]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor], dict[str, bool]]:
         with torch.no_grad():
             slab_desc = self._slab_descriptor(atoms)
             slab_energy, slab_unc, slab_applied = self._component_result(
@@ -258,7 +239,7 @@ class CalculatorCESparseGPR:
                 uncertainty_mode=uncertainty_mode,
             )
 
-            ads_desc, carbon_indices, _ = self._adsorption_site_descriptors(atoms)
+            ads_desc, _ = self._ads_descriptors(atoms)
             ads_energy, ads_unc, ads_applied = self._component_result(
                 self.ads_model,
                 ads_desc,
@@ -266,47 +247,36 @@ class CalculatorCESparseGPR:
                 uncertainty_mode=uncertainty_mode,
             )
 
-            rep_desc = self._repulsion_descriptors(atoms, carbon_indices)
-            rep_energy, rep_unc, rep_applied = self._component_result(
-                self.rep_model,
-                rep_desc,
-                compute_uncertainty=compute_uncertainty,
-                uncertainty_mode=uncertainty_mode,
-            )
-
-            total_energy = slab_energy + ads_energy + rep_energy
-            total_uncertainty = torch.sqrt(slab_unc ** 2 + ads_unc ** 2 + rep_unc ** 2)
+            total_energy = slab_energy + ads_energy
+            total_uncertainty = torch.sqrt(slab_unc ** 2 + ads_unc ** 2)
 
             component_uncertainties = {
                 "slab": slab_unc,
                 "ads": ads_unc,
-                "rep": rep_unc,
                 "total": total_uncertainty,
             }
             component_applied = {
                 "slab": slab_applied,
                 "ads": ads_applied,
-                "rep": rep_applied,
             }
 
         return (
             slab_energy,
             total_energy,
             ads_energy,
-            rep_energy,
             total_uncertainty,
             component_uncertainties,
             component_applied,
         )
 
     def __call__(self, atoms: ase.Atoms):
-        """Return slab_energy, total_energy, ads_energy, rep_energy."""
+        """Return slab_energy, total_energy, ads_energy."""
         result = self._evaluate_components(
             atoms=atoms,
             compute_uncertainty=False,
         )
-        slab_energy, total_energy, ads_energy, rep_energy = result[:4]
-        return slab_energy, total_energy, ads_energy, rep_energy
+        slab_energy, total_energy, ads_energy = result[:3]
+        return slab_energy, total_energy, ads_energy
 
     def predict_energy_and_uncertainty(
         self,
@@ -324,14 +294,14 @@ class CalculatorCESparseGPR:
         if return_applied:
             return result
 
-        return result[:6]
+        return result[:5]
 
     def uncertainty(self, atoms: ase.Atoms, uncertainty_mode: str = "quadrature"):
         result = self.predict_energy_and_uncertainty(
             atoms=atoms,
             uncertainty_mode=uncertainty_mode,
         )
-        return result[4], result[5]
+        return result[3], result[4]
 
     def predict_uncertainty(self, atoms: ase.Atoms, uncertainty_mode: str = "quadrature"):
         total_uncertainty, _ = self.uncertainty(

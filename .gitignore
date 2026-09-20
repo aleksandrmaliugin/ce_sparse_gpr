@@ -13,19 +13,36 @@ env/
 
 # PyCharm
 .idea/
+.claude/
 
-# Jupyter
+# Jupyter (notebooks are not committed)
 .ipynb_checkpoints/
+*.ipynb
 
 # Data / models / trajectories
-*.pt
 *.pth
-*.traj
 *.xyz
 *.h5
 *.hdf5
+*.tar
 *.db
-*.ipynb
+*.traj
+!examples/mc/seed_structure.traj
+!examples/training/datasets/clean.db
+!examples/training/datasets/ads.db
+examples/mc/benchmark_mc.py
+examples/mc/benchmark_training.py
+
+
+# Runs, reports, logs, scratch
+runs/
+reports/
+models_old/
+active_learning_runs/
+_datasets/
 
 # OS
 .DS_Store
+
+# Local one-off scripts
+filter_active_learning_candidates_ce.py

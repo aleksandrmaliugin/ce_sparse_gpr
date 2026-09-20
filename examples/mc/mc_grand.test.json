@@ -1,0 +1,68 @@
+{
+  "seed": 1234,
+  "device": "cpu",
+
+  "structure": {
+    "cell": "seed_structure.traj",
+    "cell_format": null,
+    "ignore_cell_adsorbates": false,
+    "initial_site_match_tol": 0.35,
+    "supercell": [2, 2, 2],
+    "lattice_constant": 3.98398,
+    "pd_fraction": 0.5
+  },
+
+  "models": {
+    "slab_model": "../training/models/clean/model_best.pt",
+    "ads_model": "../training/models/ads/model_best.pt",
+    "freq_model": null,
+    "allow_unsafe_model_load": false
+  },
+
+  "thermo": {
+    "temperature": 300.0,
+    "delta_mu": -0.52
+  },
+
+  "mc": {
+    "nsteps": 10000,
+    "co_height": 1.60,
+    "co_bond": 1.15,
+    "min_co_distance": 1.52,
+    "z_atol": 1e-3,
+    "bridge_cutoff_factor": 1.25,
+    "layer_z_tol": 0.1,
+    "freeze_layers": [],
+    "freeze_bottom_layers": 0,
+    "local_cutoff_margin": 0.05
+  },
+
+  "output": {
+    "print_every": 100,
+    "write_every": 100,
+    "trajectory": "mc_al_test_traj.xyz",
+    "output": "mc_al_test_final.xyz"
+  },
+
+  "active_learning": {
+    "enabled": false,
+    "run_script": "run.py",
+    "run_dir": "active_learning_runs",
+    "poscar_name": "in.poscar",
+    "finished_marker": "final.traj",
+    "energy_file": "final.e",
+    "uncertainty_thresholds": {
+      "slab": 10.05,
+      "ads": 0.35
+    },
+    "datasets": {
+      "slab": "datasets/al_test_slab.db",
+      "ads": "datasets/al_test_ads.db"
+    },
+    "train_configs": {
+      "slab": "al_train_slab.test.json",
+      "ads": "al_train_ads.test.json"
+    },
+    "co_gas_outcar": "../../datasets/low_cov/CO_gase/OUTCAR"
+  }
+}

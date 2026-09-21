@@ -15,21 +15,7 @@ BEST_MODEL_METRICS = ("rmse_valid", "rmse_valid_per_co", "loss")
 
 
 def stratification_labels_from_n_co(n_co, n_splits: int) -> np.ndarray:
-    """Bucket-label each structure by its (possibly merged) n_co, for
-    StratifiedKFold - not the raw n_co itself, because a class with fewer
-    than n_splits members (e.g. n_co=9 with a single example in
-    ads_unified.db) makes StratifiedKFold.split raise outright ("least
-    populated class ... too few members").
 
-    Adjacent n_co values are greedily merged (lowest first) into buckets of
-    at least n_splits members each - any leftover too-small remainder at the
-    top end joins the last sealed bucket. For ads_unified.db's distribution
-    {1:481, 4:87, 5:92, 6:72, 7:41, 8:30, 9:1} with n_splits=5 this yields
-    buckets {1},{4},{5},{6},{7},{8,9}: n_co=9's lone example rides along
-    with its nearest coverage neighbor instead of crashing the split. This
-    only affects which fold a structure lands in - its actual n_co value
-    (used elsewhere for the per-CO RMSE metric/target) is untouched.
-    """
     n_co = np.asarray(n_co).astype(int)
     unique_vals, counts = np.unique(n_co, return_counts=True)
     order = np.argsort(unique_vals)
@@ -50,44 +36,15 @@ def stratification_labels_from_n_co(n_co, n_splits: int) -> np.ndarray:
         if buckets:
             buckets[-1].extend(current_vals)
         else:
-            # Every class pooled together still has fewer than n_splits
-            # structures total - StratifiedKFold cannot possibly succeed
-            # here regardless of labeling; let it raise its own clear error
-            # downstream rather than silently returning something bogus.
+
             buckets.append(current_vals)
 
     val_to_bucket = {v: i for i, vals in enumerate(buckets) for v in vals}
     return np.array([val_to_bucket[v] for v in n_co.tolist()])
 
-# How far raw_lengthscale (pre-softplus) is allowed to stray from each
-# dimension's own natural scale (std of that descriptor over the inducing
-# points), applied after every optimizer step/closure call. A *fixed*
-# absolute bound (an earlier version used [1e-3, 1e3] globally, back when
-# lengthscale was exp(log_lengthscale)) is wrong for descriptors whose real
-# spread is O(1-20): at lengthscale=1000, the RBF kernel value across the
-# ENTIRE real data range for such a dimension differs by <2e-4 - the
-# dimension is fully collapsed to a constant, and if several dimensions
-# collapse at once, K_MM/K_NM become near-rank-1 and no jitter fixes that.
-# ratio=20 keeps the kernel's value spread over +/-2 std at roughly
-# [0.98, 1.0] - still lets the optimizer down-weight an uninformative
-# dimension a lot, without fully collapsing it. (Since gpr.py switched
-# lengthscale/sigma2/outputscale from exp(raw) to softplus(raw) - which grows
-# only linearly, not exponentially, for large raw - a single bad optimizer
-# step can no longer blow these up by many orders of magnitude the way it
-# could before; these clamps are now a secondary safety net, not the primary
-# defense.)
 _LENGTHSCALE_RATIO = 20.0
 _LENGTHSCALE_FALLBACK_SCALE = 1.0  # used only if x_M has a single row (std undefined)
 
-# outputscale is the kernel's overall prior-variance multiplier and sigma2 is
-# the noise variance - both can still drift a long way in raw-space even
-# under softplus, so keep them bounded too. [1e-6, 1e6] is generous either
-# for raw unnormalized DFT energies or for standardized targets. sigma2's
-# floor is 1e-6, not 1e-8: a near-perfect fold fit pushes sigma2 toward 0,
-# and safe_cholesky's jitter cap is itself a fraction of sigma2 - at 1e-8
-# that budget becomes razor-thin right when a good fit makes it most likely
-# to be needed. 1e-6 keeps a workable jitter budget without forcing a
-# noticeably noisier fit than 1e-8 would have.
 _RAW_OUTPUTSCALE_MIN = float(inv_softplus(torch.tensor(1e-6)))
 _RAW_OUTPUTSCALE_MAX = float(inv_softplus(torch.tensor(1e6)))
 _RAW_SIGMA2_MIN = float(inv_softplus(torch.tensor(1e-6)))
@@ -102,18 +59,6 @@ def _clamp_hyperparameters(model) -> None:
         else:
             scale = torch.zeros_like(model.raw_lengthscale)
 
-        # A descriptor dimension that is (numerically) constant across the
-        # inducing points - e.g. a "center is element X" indicator when every
-        # structure is centered on that element, as in the rep pipeline's
-        # "single atom: C" feature - has no data-driven scale to normalize
-        # by. clamp_min(1e-6) alone treats that 0 as if it were a real, tiny
-        # scale and forces the lengthscale itself down near it (~[5e-8, 2e-5]
-        # at ratio=20) - which then amplifies ordinary float64 round-off
-        # between inducing points that should be exactly equal along that
-        # dimension into a large scaled distance, corrupting K_MM (observed:
-        # min eigenvalue going slightly negative). Falling back to a large,
-        # non-binding scale for degenerate dimensions avoids that instead of
-        # causing it; every non-degenerate dimension is completely unaffected.
         degenerate = scale < 1e-6
         scale = torch.where(
             degenerate, torch.full_like(scale, _LENGTHSCALE_FALLBACK_SCALE), scale
@@ -208,15 +153,7 @@ def rmse_metric(y_pred, y_true):
 
 
 def rmse_metric_per_co(y_pred, y_true, n_co):
-    """RMSE of (pred-true)/n_co per structure, instead of the raw residual -
-    used as the checkpoint-selection metric (see train_lbfgs's
-    selection_metric) on _datasets whose target spans a wide n_co range (e.g.
-    ads_unified's e_ads_total: ~-1.6 eV at n_co=1 up to ~-10 eV at n_co=8).
-    A plain whole-structure RMSE is implicitly dominated by the high-coverage
-    tail simply because its errors live on a bigger absolute scale, not
-    because the model is actually worse there per adsorbed molecule -
-    dividing each structure's error by its OWN n_co first puts every CO on
-    comparable footing regardless of how many share a structure."""
+
     if y_pred.shape != y_true.shape:
         raise ValueError(
             f"Shape mismatch in RMSE/CO: y_pred={tuple(y_pred.shape)}, y_true={tuple(y_true.shape)}."
@@ -376,25 +313,7 @@ def train_with_restarts(
     min_lr: float = 1e-4,
     print_every: int = 50,
 ):
-    """Run train() for up to n_restarts+1 cycles, each with a freshly built
-    optimizer/scheduler (via the factories), reloading the best checkpoint
-    found so far before every cycle after the first.
 
-    This is the "reset optimizer and scheduler" workflow automated: once
-    ReduceLROnPlateau bottoms out at min_lr, Adam's accumulated moment
-    estimates are usually stale for the local landscape near the current
-    optimum, and simply continuing training rarely helps further. Reloading
-    the best weights and starting a brand new optimizer/scheduler (fresh
-    moments, fresh LR, fresh patience counter) often finds more improvement.
-
-    optimizer_factory: callable(model) -> optimizer, e.g.
-        lambda m: torch.optim.Adam(m.parameters(), lr=1e-1)
-    scheduler_factory: callable(optimizer) -> scheduler, or None, e.g.
-        lambda opt: torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=20)
-    n_restarts: number of *additional* cycles after the first (n_restarts=3 -> up to 4 cycles total)
-    min_improvement: stop restarting early once a cycle improves best RMSE
-        (valid) by less than this amount
-    """
     if n_restarts < 0:
         raise ValueError("n_restarts must be non-negative.")
 
@@ -467,60 +386,7 @@ def train_lbfgs(
     loss_plateau_tol: float = 0.5,
     valid_n_co=None,
 ):
-    """Fit GP hyperparameters (lengthscale/sigma2/outputscale) with L-BFGS
-    instead of Adam + a LR scheduler.
 
-    The NLL surface here is smooth and low-dimensional (a handful to a few
-    dozen free parameters, full-batch, no stochasticity) - exactly the regime
-    quasi-Newton methods are built for, which is why GPML/GPflow/sklearn all
-    default to L-BFGS-B for GP hyperparameter fitting rather than an
-    SGD-family optimizer. Each optimizer.step(closure) call already runs its
-    own internal line search (up to max_iter evaluations), so this typically
-    needs far fewer outer iterations than Adam and no LR schedule or restart
-    tricks - a low or oscillating step size from the line search doesn't mean
-    the fit is stuck the way a decayed Adam LR does.
-
-    n_steps: number of optimizer.step(closure) calls (outer iterations)
-    max_iter: LBFGS's own per-step cap on internal line-search iterations
-    loss_plateau_window, loss_plateau_tol: STOP once the LOSS has plateaued -
-        it dropped by less than loss_plateau_tol over the last
-        loss_plateau_window steps as a whole, i.e. compare loss now against
-        loss loss_plateau_window steps ago (not against a running best).
-        loss_plateau_window=None disables the check (always runs n_steps).
-        Stopping is ALWAYS on the loss, whatever best_model_metric is: the
-        loss is what LBFGS actually optimizes and is far smoother than any
-        held-out metric (a small valid fold evaluated mid-optimization
-        bounced 0.190->0.155->0.194->0.235 step to step while still trending
-        down - stopping on that noise risks quitting right before a real
-        improvement). A plain "no NEW best in N steps" check almost never
-        triggers under LBFGS here, since the loss keeps crawling down by
-        vanishingly small amounts long after any practically useful progress
-        has stopped (observed: rep_linear_mean's fold 1 still improved loss
-        by ~0.01-0.02 per step at step 990/1000). Many tiny "technically an
-        improvement" steps each fail to beat the previous best individually,
-        yet sum to less than loss_plateau_tol over the window, so it stops.
-        loss_plateau_tol is on the loss' own absolute scale (not relative) -
-        pick it per problem, the same way div/lr already are.
-    best_model_metric: which step's model gets SAVED as the best checkpoint
-        (independent of when training stops):
-        "rmse_valid"        lowest RMSE on the held-out valid set (default).
-        "rmse_valid_per_co" lowest RMSE of (pred-true)/n_co on valid (needs
-            valid_n_co; see rmse_metric_per_co). Use on a target whose scale
-            grows with n_co (e.g. ads_unified's e_ads_total: ~-1.6 eV at
-            n_co=1 vs ~-10 eV at n_co=8) so the "best" checkpoint is the one
-            most accurate per adsorbed CO, not just the one that fits the
-            high-coverage (large-absolute-error) tail best.
-        "loss"              lowest training loss (NLL), evaluated at the
-            model's CURRENT parameters after each step. Uses no held-out
-            data at all - meant for active learning, where the valid fold is
-            tiny/unrepresentative right after a new point is added.
-        The returned best_rmse_valid is that metric's best value, except for
-        "loss", where it is the raw RMSE valid AT the saved (lowest-loss)
-        step - a loss value is not comparable across folds/datasets and
-        callers rank folds by held-out error.
-    valid_n_co: one entry per valid_x structure; required (and only used)
-        when best_model_metric="rmse_valid_per_co".
-    """
     if n_steps <= 0:
         raise ValueError("n_steps must be positive.")
 
@@ -565,11 +431,7 @@ def train_lbfgs(
     best_step = None
 
     def closure():
-        # LBFGS's own internal line search calls this closure several times
-        # per step() at points *it* picks - clamp before every evaluation
-        # (not just after step() returns), or the line search can probe a
-        # pathological lengthscale and crash neg_log_like_loss's Cholesky
-        # before we ever get control back.
+
         _clamp_hyperparameters(model)
         optimizer.zero_grad(set_to_none=True)
         loss = model.neg_log_like_loss(train_x, train_y, skip_validation=True)
@@ -594,10 +456,7 @@ def train_lbfgs(
             if use_per_co:
                 rmse_valid_per_co = rmse_metric_per_co(pred_valid, valid_y, valid_n_co)
             if best_model_metric == "loss":
-                # Loss at the parameters we are about to checkpoint - the
-                # `loss` returned by optimizer.step is the value at the START
-                # of the step (before the parameter update), so it would
-                # score the previous step's weights.
+
                 post_step_loss = float(model.neg_log_like_loss(train_x, train_y, skip_validation=True).item())
 
         rmse_train_val = float(rmse_train.item())
@@ -630,8 +489,6 @@ def train_lbfgs(
                 f"best {metric_name}: {best_rmse_valid:.6f}"
             )
 
-        # Windowed loss plateau (see loss_plateau_window/loss_plateau_tol).
-        # Needs loss_plateau_window+1 loss values on hand.
         if loss_plateau_window is not None and step >= loss_plateau_window:
             loss_decrease = history["neg_log_like"][step - loss_plateau_window] - loss_val
             if loss_decrease < loss_plateau_tol:
@@ -674,9 +531,7 @@ def evaluate(
 
 
 def load_model_like(model, model_path, device=torch.device("cpu")):
-    """
-    Load a checkpoint using the same model class as a template instance.
-    """
+
     return type(model)(model_path=model_path, device=device)
 
 
@@ -699,11 +554,7 @@ def train_kfold(
     min_lr: float = 1e-4,
     evaluate_best_checkpoint: bool = True,
 ):
-    """test_x/test_y are optional: pass both to get an independent RMSE per
-    fold (rmse_test_mean/std in the summary); leave both None to skip that and
-    rely on the cross-validated rmse_valid_mean/std alone as the generalization
-    estimate - a reasonable substitute for a held-out test set when data is too
-    scarce to sacrifice a chunk of it permanently."""
+
     if (test_x is None) != (test_y is None):
         raise ValueError("test_x and test_y must be both given or both omitted.")
 
@@ -838,32 +689,7 @@ def train_kfold_lbfgs(
     n_co=None,
     **lbfgs_kwargs,
 ):
-    """Same as train_kfold, but each fold is fit with train_lbfgs instead of
-    Adam + a scheduler. No optimizer/scheduler arguments needed - L-BFGS is
-    constructed fresh per fold (bound to that fold's own model copy) inside
-    train_lbfgs, so there's no optimizer/scheduler tuple to clone.
 
-    test_x/test_y are optional: pass both for an independent per-fold RMSE
-    (rmse_test_mean/std in the summary); leave both None to rely on
-    rmse_valid_mean/std alone as the generalization estimate.
-
-    max_folds: train/evaluate only the first this-many folds instead of all
-    n_splits - the KFold split itself is unaffected (n_splits still sets the
-    train/valid size ratio and which indices land in fold 1, 2, ...), so this
-    is for cheaply getting a single representative holdout run (max_folds=1)
-    without paying for n_splits full LBFGS fits, e.g. while a dataset is too
-    small/imbalanced (a handful of examples in some rare stratum) for a full
-    K-fold summary to be a meaningful average in the first place.
-
-    n_co: optional, one entry per train_x structure (same order/length).
-    Two effects: (1) the K-fold split is stratified by (bucketed) n_co
-    instead of plain-shuffled - see stratification_labels_from_n_co; (2) it
-    is sliced per fold and passed to train_lbfgs as valid_n_co, which uses it
-    only for best_model_metric="rmse_valid_per_co" (that metric REQUIRES
-    n_co here). None (default): ordinary unstratified KFold.
-
-    best_model_metric, loss_plateau_window, loss_plateau_tol: forwarded to
-    train_lbfgs via **lbfgs_kwargs - see its docstring."""
     if (test_x is None) != (test_y is None):
         raise ValueError("test_x and test_y must be both given or both omitted.")
 
@@ -883,14 +709,7 @@ def train_kfold_lbfgs(
     indices = list(range(len(train_x)))
 
     if n_co is not None:
-        # Stratify by (bucketed) n_co instead of a plain shuffle: an
-        # unstratified split's fold composition swings a lot with dataset
-        # heterogeneity (e.g. this project's ads_unified.db, where growing
-        # the dataset by a single active-learning point reshuffles every
-        # fold boundary and produced visibly different-looking training
-        # trajectories run to run) - stratifying keeps each fold's coverage
-        # mix comparable, so fold-to-fold variance reflects the model, not
-        # which structures happened to land in which split.
+
         strat_labels = stratification_labels_from_n_co(n_co.detach().cpu().numpy(), n_splits)
         kfold = StratifiedKFold(
             n_splits=n_splits,

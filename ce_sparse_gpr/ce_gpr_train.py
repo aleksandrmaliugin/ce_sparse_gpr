@@ -96,35 +96,18 @@ def load_config(path) -> dict:
 
 
 def _usable_for_per_co_metric(n_co_values) -> bool:
-    """True only if every row carries a genuine adsorbate count (>0).
 
-    n_co is None where the key is simply absent (e.g. rep.db before
-    make_rep_anchors.py), but clean/slab _datasets (e.g. clean.db) instead
-    store an explicit n_co=0 on every row - not None, but still not a valid
-    denominator for a per-CO residual (rmse_metric_np_per_co/_per_co_residual
-    require n_co > 0). Both cases must be rejected here.
-    """
     return n_co_values is not None and all(n is not None and n > 0 for n in n_co_values)
 
 
 def _best_model_filename(model_filename: str) -> str:
-    """model.pt -> model_best.pt (or model_fold_3.pt -> model_fold_3_best.pt):
-    a stable, method-agnostic name for the checkpoint actually used for the
-    parity plot/metrics, so users don't have to know which fold "won" or
-    whether K-fold was even used to find the model that matters."""
+
     p = Path(model_filename)
     return f"{p.stem}_best{p.suffix}"
 
 
 def load_named_dataset(section_cfg: dict | list[dict]):
-    """Load (atoms, target_y, path) lists from the ase.db(s) described by a
-    config section shaped like {"db_path": ..., "target_y": "dft_energy"}, or
-    a list of such dicts to concatenate multiple sources into one training
-    set - e.g. real DFT rows plus a separate db of synthetic anchor points
-    (see make_rep_anchors.py: n_co=1 structures with e_rep=0, added because
-    rep.db itself has no examples below n_co=4 and a linear mean function
-    fit only on n_co=4..10 extrapolates to nonsensical negative repulsion
-    energies well before reaching n_co=1)."""
+
     sections = section_cfg if isinstance(section_cfg, list) else [section_cfg]
 
     atoms_list, y, paths, n_co = [], [], [], []
@@ -148,25 +131,7 @@ def load_named_dataset(section_cfg: dict | list[dict]):
 
 
 def build_atom_indices(atoms_list, atom_indices_cfg: dict | None):
-    """descriptor.atom_indices selects which atoms each structure's descriptor
-    rows are built from, and whether those rows collapse into one vector.
 
-    None (or no "source"): reproduces the original clean/slab pipeline - every
-    atom contributes its own descriptor row, and build_K_NM's own per-structure
-    sum gives an additive whole-slab energy model.
-
-    "near_carbon_metals" (aggregate: true): rows are restricted to the metal
-    atoms defining a structure's occupied CO site (atoms_near_carbon's first
-    return value), then summed into a single vector describing that site as a
-    whole - low_cov.ipynb's ads-site pipeline. Required because a site's own
-    energy is not an additive sum over its neighbor metals' individual
-    descriptors, unlike the whole-slab case above.
-
-    "carbon_atoms" (aggregate: false): rows are restricted to (one row per)
-    carbon atom, left unaggregated so build_K_NM's own additive atom-sum
-    accumulates one contribution per adsorbed CO in the structure -
-    rep.ipynb's repulsion pipeline.
-    """
     if not atom_indices_cfg or not atom_indices_cfg.get("source"):
         return None, False
 
@@ -195,10 +160,7 @@ def maybe_aggregate_site_rows(x_list, aggregate: bool):
 def load_optional_test_tensors(
     cfg: dict, ce_config: CEConfig, atom_indices_cfg: dict | None, dtype: torch.dtype = torch.float64
 ):
-    """test_dataset is a stub until a real held-out test set exists: return
-    (None, None) while its db_path is unset, otherwise build descriptors for
-    it with the SAME (already-fitted) ce_config so dimensions line up with
-    train_x."""
+
     test_cfg = cfg.get("test_dataset")
     if not test_cfg or not test_cfg.get("db_path"):
         return None, None
@@ -232,19 +194,7 @@ def build_descriptor_config(cfg: dict, atoms_list) -> CEConfig:
 
 
 def resolve_init_lengthscale(model_cfg: dict, train_x):
-    """model.init_lengthscale: a number/list (used as-is, current behavior) or
-    the string "auto" - per-dimension std of the descriptor over all training
-    atoms.
 
-    select_inducing_points() scales distances by the model's *initial*
-    lengthscale (it runs once at construction, before any fitting), so a
-    single scalar guess applied uniformly across dimensions with very
-    different natural scales (e.g. binary "single atom" features vs. pair
-    counts up to 20) makes that scaling arbitrary for most dimensions - which
-    plausibly contributed to the wild multi-hyperparameter excursions seen
-    while debugging this pipeline. Std-per-dimension gives every dimension a
-    comparable starting normalization instead.
-    """
     value = model_cfg.get("init_lengthscale", 1.0)
     if value != "auto":
         return value
@@ -262,41 +212,7 @@ def resolve_warm_start(
     device: str,
     fallback_checkpoint_path: str | Path | None = None,
 ):
-    """model.warm_start: true - if a checkpoint from a PREVIOUS run of this
-    same config already sits at its own output path, load its converged
-    lengthscale/sigma2/outputscale (and linear_mean, if any) and use them as
-    this run's init values instead of the config's init_lengthscale/
-    init_sigma2/init_outputscale/"auto".
 
-    Why: this is the exact situation active learning creates - the same
-    train_config gets re-run from scratch after every new DFT point, and
-    LBFGS spends its first few steps just re-discovering roughly the same
-    hyperparameters it already found last cycle (loss dropping from ~1e7 to
-    ~1e2 in the first 2-3 steps, every single time - see any AL retrain log).
-    Starting from where the previous cycle actually converged skips that
-    rediscovery. This does NOT warm-start x_M/c: inducing points are always
-    reselected fresh from the current (grown) dataset (see
-    SparseAtomicGPR.select_inducing_points) - only the continuous
-    hyperparameters, which don't depend on which points got selected.
-
-    fallback_checkpoint_path: used ONLY when `checkpoint_path` doesn't exist
-    yet (this train_config's own output dir has never been written to - e.g.
-    active learning's very first cycle). Lets ActiveLearningController pass
-    the model the running MC evaluator was ACTUALLY deployed with (its
-    "models.ads_model"/"models.slab_model" config entry, generally a
-    manually-trained baseline living somewhere else entirely, e.g.
-    "../training/models/ads/model_best.pt") - without this, cycle 1 would
-    cold-start from the config's own init_lengthscale/"auto" even though a
-    perfectly good, already-converged model already exists and is right now
-    live in the evaluator, wasting exactly the rediscovery this feature
-    exists to skip.
-
-    Returns (init_lengthscale, init_sigma2, init_outputscale, linear_mean_or_None).
-    Falls back to config defaults (None sentinel for "not overridden") if
-    warm_start is off, no previous/fallback checkpoint exists yet (first
-    cycle with nothing deployed either), or its descriptor dimension no
-    longer matches (e.g. shells/max_order changed).
-    """
     if not model_cfg.get("warm_start", False):
         return None, None, None, None
 
@@ -365,17 +281,7 @@ _REMOVED_LBFGS_KEYS = {
 
 
 def selection_and_stop_kwargs(training_cfg: dict) -> dict:
-    """The three tags controlling the best checkpoint and when to stop:
 
-    training.best_model_metric       "rmse_valid" | "rmse_valid_per_co" | "loss"
-        which step's model is SAVED as best (see train_lbfgs).
-    training.lbfgs.loss_plateau_window   steps; null disables the stop rule.
-    training.lbfgs.loss_plateau_tol      minimum loss drop over that window.
-        Stopping is always on the loss plateau, whatever the metric above.
-
-    Removed keys are rejected outright: an unrecognized key would otherwise
-    be silently ignored and the run would quietly use defaults instead of
-    what the config says."""
     lbfgs_cfg = training_cfg.get("lbfgs", {})
     stale = [f"{k!r} -> {v}" for k, v in _REMOVED_TRAINING_KEYS.items() if k in training_cfg]
     stale += [f"lbfgs.{k!r} -> {v}" for k, v in _REMOVED_LBFGS_KEYS.items() if k in lbfgs_cfg]
@@ -394,11 +300,7 @@ def run_training(
     method = training_cfg.get("method", "adam")
 
     if method == "adam":
-        # Non-K-fold methods need an explicit valid split for early stopping
-        # during training itself (unlike K-fold, which carves its own out of
-        # train_x per fold). No held-out set is configured here, so this
-        # falls back to validating against the training set itself - fine for
-        # a quick fit, but prefer a K-fold method for a real accuracy read.
+
         adam_cfg = training_cfg.get("adam", {})
         optimizer, scheduler = build_optimizer_scheduler(model, adam_cfg)
         history, best_rmse = train(
@@ -457,10 +359,7 @@ def run_training(
     if method == "kfold_lbfgs":
         lbfgs_cfg = training_cfg.get("lbfgs", {})
         kfold_cfg = training_cfg.get("kfold", {})
-        # n_co is passed whenever the dataset has a usable one: it stratifies
-        # the K-fold split by coverage, and is the per-fold valid_n_co that
-        # best_model_metric="rmse_valid_per_co" needs. Clean/slab datasets
-        # (n_co missing, or 0 on every row) fall back to a plain KFold.
+
         n_co_for_kfold = n_co_all if _usable_for_per_co_metric(n_co_all) else None
         if training_cfg.get("best_model_metric") == "rmse_valid_per_co" and n_co_for_kfold is None:
             raise ValueError(
@@ -492,18 +391,7 @@ def run_training(
 
 
 def run(config_path: str, warm_start_fallback: str | None = None, save_plot: bool = True) -> Path:
-    """warm_start_fallback: passed straight through to resolve_warm_start's
-    fallback_checkpoint_path - the currently-deployed model to bootstrap
-    warm_start from on this config's very first run (before its own
-    output.dir has ever been written to). Callers outside active learning
 
-    save_plot: write the parity plot to output.plot_filename via Plotly's
-    fig.write_image (needs the kaleido package - a headless-Chromium static
-    image renderer). Pass False to skip it: write_image spawns a fresh
-    kaleido subprocess EVERY call, and repeated calls within one long-lived
-    Python process (e.g. active learning re-invoking run() once per
-    retraining cycle) have been observed to eventually hang indefinitely -
-    see ActiveLearningController.run_cycle, which always passes False."""
     cfg = load_config(config_path)
 
     seed = cfg.get("seed", 42)
@@ -543,13 +431,7 @@ def run(config_path: str, warm_start_fallback: str | None = None, save_plot: boo
                     f"aggregate={aggregate_site_rows}"
                 )
 
-            # dtype=dtype: CEDataset defaults to float32 (torch.utils.data.Dataset
-            # convention), but every downstream consumer (SparseAtomicGPR,
-            # training) assumes float64 - without this, target_y (DFT energies,
-            # O(100-1000) eV) gets silently rounded to float32 precision
-            # (~1e-4 eV absolute error) before being upcast back to float64 for
-            # training, fighting the very sub-0.1 eV accuracy this pipeline is
-            # tuned for.
+
             dataset = CEDataset(
                 atoms=atoms_list,
                 config=ce_config,
@@ -577,11 +459,7 @@ def run(config_path: str, warm_start_fallback: str | None = None, save_plot: boo
             print()
 
             model_cfg = cfg["model"]
-            # This stays the GEOMETRIC reference for select_inducing_points
-            # (see induce_lengthscale below) even when warm-starting - a
-            # converged ARD lengthscale is the wrong scale for that (most
-            # dimensions pushed to near-irrelevance, collapsing the diversity
-            # criterion almost everywhere; see resolve_warm_start/gpr.py).
+
             auto_lengthscale = resolve_init_lengthscale(model_cfg, train_x)
             if model_cfg.get("init_lengthscale") == "auto":
                 print(f"init_lengthscale (auto, per-dim std): {[round(v, 4) for v in auto_lengthscale]}")
@@ -624,14 +502,7 @@ def run(config_path: str, warm_start_fallback: str | None = None, save_plot: boo
                 json.dump(_json_sanitize(result), f, indent=2)
 
             if result["method"] in ("kfold_adam", "kfold_lbfgs"):
-                # K-fold trains a separate deep-copied model per fold and
-                # checkpoints each one under its own _fold_N path (see
-                # _checkpoint_path in train.py); the plain model_path is never
-                # written and the original `model` object here was never
-                # fitted. Evaluate/plot the fold with the best valid RMSE,
-                # using THAT fold's own held-out indices for the "Valid" trace
-                # below - it's the only valid split that actually exists now
-                # that the top-level dataset isn't split anymore.
+
                 fold_results = result["summary"]["fold_results"]
                 best_fold = min(fold_results, key=lambda r: r["best_rmse_valid"])
                 best_model_path = best_fold["model_path"]
@@ -644,14 +515,10 @@ def run(config_path: str, warm_start_fallback: str | None = None, save_plot: boo
                 plot_valid_n_co = [n_co_all[i] for i in best_fold["valid_idx"]]
             else:
                 best_model_path = model_path
-                # adam/lbfgs (non-K-fold) were trained validating against the
-                # training set itself (see run_training) - keep that for the plot.
+
                 plot_valid_x, plot_valid_y = train_x, train_y
                 plot_valid_n_co = n_co_all
 
-            # best_filename/best_model_copy_path were already resolved above
-            # (used for warm_start's own checkpoint lookup) - reuse them here
-            # rather than recomputing, so both refer to the exact same path.
             wrote_checkpoint = Path(best_model_path).exists()
             if wrote_checkpoint:
                 model = SparseAtomicGPR(model_path=best_model_path, device=device)
@@ -666,9 +533,6 @@ def run(config_path: str, warm_start_fallback: str | None = None, save_plot: boo
 
             plot_path = str(output_dir / cfg["output"].get("plot_filename", "parity.pdf"))
 
-            # plot_results() calls fig.show(), which would try to pop open a
-            # browser in this non-interactive/headless run - suppress just
-            # that call without touching plot.py.
             original_show = go.Figure.show
             go.Figure.show = lambda self, *a, **k: None
             try:
@@ -688,9 +552,6 @@ def run(config_path: str, warm_start_fallback: str | None = None, save_plot: boo
 
             print("Final metrics:", metrics)
 
-            # Per-CO metrics for visibility (checkpoint SELECTION already
-            # happened per-CO inside run_training when selection_metric="per_co" -
-            # this just reports the same quantity on the reloaded best model).
             if _usable_for_per_co_metric(n_co_all) and _usable_for_per_co_metric(plot_valid_n_co):
                 with torch.no_grad():
                     train_pred = model(train_x)

@@ -46,16 +46,6 @@ class AdsorptionSite:
 
 @dataclass
 class EnergyComponents:
-    """total = slab + ads + freq.
-
-    "ads" is the single per-CO adsorption model (additive across every
-    occupied site, one descriptor row per carbon atom) - it covers both the
-    base adsorption energy AND CO-CO lateral interactions in one model, since
-    those used to be two separate components (ads + rep) fit to two separate
-    descriptor styles, before the rep-style ("carbon_atoms", additive, no
-    minimum-coverage gate) descriptor was found to subsume the old ads-style
-    one (metal-centered, aggregated per site) entirely - see ads_unified.
-    """
 
     total: float
     slab: float

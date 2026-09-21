@@ -381,12 +381,7 @@ class ClusterExpansion:
         for hips_name in shell_names:
             hips_pairs = pair_clusters.get(hips_name, [])
             if not hips_pairs:
-                # Nothing centered in this shell - skip straight to the next
-                # hips_name instead of paying for len(shells) empty base_name
-                # buckets below. With len(shells) large (e.g. 33 for the rep
-                # descriptor) and few requested centers (the common case for
-                # a local/incremental MC descriptor update), most hips_name
-                # buckets ARE empty, so this alone skips most of the work.
+
                 continue
             neigh = self.pairlist_to_center_dict(hips_pairs)
 
@@ -395,19 +390,10 @@ class ClusterExpansion:
                 if n < 2:
                     continue
 
-                # Precompute periodic image positions for all neighbors at once.
                 j_ids = np.fromiter((j for j, _, _ in nbrs), dtype=int, count=n)
                 S_nbrs = np.array([Sj for _, Sj, _ in nbrs], dtype=float)
                 pos_imgs = positions[j_ids] + S_nbrs @ cell  # (n, 3)
 
-                # All pairwise distances in one vectorized operation - computed
-                # ONCE per (hips_name, center), not once per base_name: the
-                # distance matrix itself doesn't depend on base_name at all,
-                # only which shell bucket each pair lands in does. The old
-                # code recomputed this same (n, n) matrix len(shells) times
-                # (33x for the rep descriptor) inside a "for base_name" loop
-                # that only ever used it to re-run the same classification
-                # with a different acceptance window.
                 diff = pos_imgs[:, None, :] - pos_imgs[None, :, :]  # (n, n, 3)
                 d_mat = np.sqrt((diff ** 2).sum(axis=-1))            # (n, n)
 
@@ -416,9 +402,7 @@ class ClusterExpansion:
                     for b in range(a + 1, n):
                         k, Sk, _ = nbrs[b]
                         d_ab = d_mat[a, b]
-                        # Shells are contiguous, non-overlapping windows (see
-                        # CEConfig._build_shells_dict), so a distance falls in
-                        # at most one - stop at the first match.
+
                         for base_name, (base_rmin, base_rmax) in shell_items:
                             if base_rmin <= d_ab < base_rmax:
                                 triplet_name = f"trip_hips_{hips_name}_base_{base_name}"
@@ -507,18 +491,7 @@ class ClusterExpansion:
         clusters: dict,
         atom_indices: list[int] | None = None,
     ) -> tuple[np.ndarray, list[str], list[str]]:
-        # atom_indices is None: unchanged full-structure behavior - one row
-        # per atom 0..n_atoms-1, block[center, col] indexed by global center.
-        #
-        # atom_indices given (the local/incremental MC path): allocate blocks
-        # sized to only the UNIQUE queried centers, not all n_atoms atoms.
-        # Every geom_type gets its own (n_atoms, D) zero block regardless of
-        # whether clusters[geom_type] is empty - for the rep descriptor
-        # (33 shells, max_order=3) that's 1057 geom_types, so a local update
-        # querying e.g. 2 atoms out of 384 was still paying for 1057 arrays
-        # of 384 rows each, ~99.5% of which could never be written to.
-        # Verified bit-identical to the old always-n_atoms-rows behavior
-        # (after generate_all_descriptors's gather-by-atom_indices below).
+
         n_atoms = len(elements_list)
         if atom_indices is None:
             local_row = None
@@ -647,9 +620,6 @@ class ClusterExpansion:
         atom_indices = self._as_index_list(atom_indices)
         elements_list = self._validate_atoms(atoms, atom_indices)
 
-        # Dedup/sort once here and reuse for both count_descriptors_atomic's
-        # row indexing and the final gather below, instead of recomputing
-        # sorted(set(atom_indices)) redundantly in each place.
         unique_indices = None if atom_indices is None else sorted(set(int(i) for i in atom_indices))
 
         if atom_indices is None:
@@ -667,11 +637,7 @@ class ClusterExpansion:
         self.full_descriptor_keys = list(descriptor_keys)
 
         if atom_indices is not None:
-            # count_descriptors_atomic returns one row per UNIQUE queried
-            # center (sorted, since that's what it was given above) - gather
-            # (with repeats, in the caller's original order) back to match
-            # atom_indices exactly, same contract as the old
-            # `descriptor[atom_indices]` full-row slice.
+
             row_of = {g: r for r, g in enumerate(unique_indices)}
             descriptor = descriptor[[row_of[int(i)] for i in atom_indices]]
 

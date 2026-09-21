@@ -370,15 +370,7 @@ def _stack_descriptor_rows(x_list) -> np.ndarray:
 
 
 def _rank_pivoted_columns(X: np.ndarray, rtol: float = 1e-8) -> tuple[int, np.ndarray, np.ndarray]:
-    """Column-pivoted QR (scipy.linalg.qr(..., pivoting=True)): the first
-    `rank` pivoted columns form a well-conditioned basis, the remaining
-    columns are (to within rtol) exact linear combinations of that basis -
-    this identifies *which* columns are redundant, not just that some are
-    (plain SVD/np.linalg.matrix_rank only gives the rank number).
 
-    Returns (rank, independent_local_idx, dependent_local_idx), indices into
-    X's own columns (sorted ascending within each group).
-    """
     singular_values = np.linalg.svd(X, compute_uv=False)
     tol = rtol * singular_values.max()
     rank = int((singular_values > tol).sum())
@@ -396,43 +388,7 @@ def find_linearly_dependent_descriptors(
     rtol: float = 1e-8,
     verbose: bool = True,
 ) -> dict:
-    """Check a descriptor matrix for exact linear dependence between columns
-    - run this on train_x/dataset.extractor.descriptor_names to see what a
-    fitted CEDataset's own descriptor_mask already pruned (build_dataset
-    calls this same rank check internally - see _make_nonzero_descriptor_mask),
-    or on a dataset built with fit_descriptor_mask=False to see it before
-    any masking at all.
 
-    Why this matters: SparseAtomicGPR gives every descriptor dimension its
-    own ARD lengthscale and repeatedly factors kernel matrices (K_MM, A)
-    built from these dimensions. A column that is an exact linear
-    combination of others (not just "correlated" - literally reconstructible
-    to machine precision) contributes zero real information but still costs
-    a free hyperparameter and, more importantly, turns the kernel matrices
-    singular along that combination - inflating their condition number by
-    orders of magnitude and making Cholesky/gradient computations amplify
-    ordinary float64 rounding error. This was root-caused for the rep
-    pipeline (ce_gpr_train.rep.example.json): 22 of its 54 kept descriptor
-    columns turned out to be exact linear combinations of the other 32 (rank
-    32/54), inflating K_MM's condition number to ~6e6 - a direct product of
-    a fixed/standardized lattice geometry (same site positions in every
-    structure, only Pt/Pd occupancy differs) plus a shell list with far more,
-    finer bins than there are physically distinct local environments.
-
-    Parameters
-    ----------
-    train_x : list of 2D arrays/tensors, one per structure (as returned by
-        CEDataset.get_all() / dataset.X).
-    names : descriptor column names matching train_x's columns, e.g.
-        dataset.extractor.descriptor_names.
-    rtol : relative tolerance (fraction of the largest singular value) below
-        which a singular value is treated as numerically zero.
-
-    Returns
-    -------
-    dict with keys: "rank", "n_features", "independent_names",
-    "dependent_names", "independent_idx", "dependent_idx".
-    """
     X = _stack_descriptor_rows(train_x)
 
     if len(names) != X.shape[1]:

@@ -121,7 +121,7 @@ def load_named_dataset(section_cfg: dict | list[dict]):
             atoms_list.append(row.toatoms())
             y.append(row.key_value_pairs[target_key])
             paths.append(row.key_value_pairs.get("path"))
-            n_co.append(row.key_value_pairs.get("n_co"))  # None where absent (e.g. clean/slab _datasets)
+            n_co.append(row.key_value_pairs.get("n_co"))  # None where absent (e.g. clean/slab datasets)
         print(f"  {len(atoms_list) - n_before} structures from {db_path!r} (target_y={target_key!r})")
 
     if len(atoms_list) == 0:

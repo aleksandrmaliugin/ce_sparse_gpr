@@ -199,12 +199,12 @@ def validate_active_learning_config(al_cfg: dict | None) -> None:
     if not os.path.exists(al_cfg["run_script"]):
         raise ValueError(f"active_learning.run_script does not exist: {al_cfg['run_script']!r}.")
 
-    datasets = al_cfg.get("_datasets", {})
+    datasets = al_cfg.get("datasets", {})
     train_configs = al_cfg.get("train_configs", {})
     thresholds = al_cfg.get("uncertainty_thresholds", {})
     for component in ActiveLearningController.COMPONENTS:
         if component not in datasets:
-            raise ValueError(f"active_learning._datasets.{component} is required.")
+            raise ValueError(f"active_learning.datasets.{component} is required.")
         if component not in train_configs:
             raise ValueError(f"active_learning.train_configs.{component} is required.")
         if not os.path.exists(train_configs[component]):
@@ -1100,7 +1100,7 @@ class ActiveLearningController:
         self.poscar_name = cfg.get("poscar_name", "in.poscar")
         self.finished_marker = cfg.get("finished_marker", "final.traj")
         self.energy_file = cfg.get("energy_file", "final.e")
-        self.datasets: dict[str, str] = dict(cfg["_datasets"])
+        self.datasets: dict[str, str] = dict(cfg["datasets"])
         self.train_configs: dict[str, str] = dict(cfg["train_configs"])
         self.co_gas_outcar = cfg.get("co_gas_outcar")
 

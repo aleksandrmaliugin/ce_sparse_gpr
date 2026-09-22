@@ -37,12 +37,12 @@
 
   "training": {
     "method": "kfold_lbfgs",
-    "best_model_metric": "rmse_valid_per_co",
+    "best_model_metric": "loss",
     "lbfgs": {
-      "n_steps": 30,
+      "n_steps": 10,
       "max_iter": 20,
       "lr": 0.1,
-      "loss_plateau_window": 5,
+      "loss_plateau_window": 20,
       "loss_plateau_tol": 0.5
     },
     "kfold": {

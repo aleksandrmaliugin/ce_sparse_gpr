@@ -1,4 +1,4 @@
-Config: .\ce_gpr_train.ads.json
+Config: ce_gpr_train.ads.json
 {
   "seed": 42,
   "device": "cpu",
@@ -56,13 +56,13 @@ Config: .\ce_gpr_train.ads.json
   },
   "training": {
     "method": "kfold_lbfgs",
-    "select_by_rmse_per_co": true,
+    "best_model_metric": "rmse_valid_per_co",
     "lbfgs": {
       "n_steps": 1000,
       "max_iter": 20,
       "lr": 0.1,
-      "early_stop_patience": 20,
-      "loss_tol": 0.5
+      "loss_plateau_window": 20,
+      "loss_plateau_tol": 0.5
     },
     "kfold": {
       "n_splits": 5,
@@ -91,6 +91,7 @@ init_lengthscale (auto, per-dim std): [0.3134, 0.115, 0.7635, 1.4262, 1.5569, 0.
 Selected 191 inducing points out of 450
 Model: M=191 inducing points, D=23
 
+K-fold: stratified by n_co (dataset has n_co on every row).
 
 Fold 1/5
 LBFGS step 1/1000 Loss: 711984.234646 RMSE train: 0.100418 RMSE valid: 0.890054 best RMSE valid/CO: 0.324136
@@ -453,7 +454,7 @@ LBFGS step 357/1000 Loss: -1918.806780 RMSE train: 0.013922 RMSE valid: 0.038046
 LBFGS step 358/1000 Loss: -1918.816942 RMSE train: 0.013913 RMSE valid: 0.037999 best RMSE valid/CO: 0.013921
 LBFGS step 359/1000 Loss: -1918.828560 RMSE train: 0.013899 RMSE valid: 0.038008 best RMSE valid/CO: 0.013921
 LBFGS step 360/1000 Loss: -1918.838430 RMSE train: 0.013895 RMSE valid: 0.038084 best RMSE valid/CO: 0.013921
-Loss dropped by only 0.481576 (< loss_tol=0.5) over the last 20 steps, stopping (best RMSE valid=0.013921 at step 102).
+Loss dropped by only 0.481576 (< loss_plateau_tol=0.5) over the last 20 steps, stopping (best RMSE valid/CO=0.013921 at step 102).
 Fold 1: best RMSE valid = 0.013921 (no test set given)
 
 Fold 2/5
@@ -768,7 +769,7 @@ LBFGS step 308/1000 Loss: -1888.684945 RMSE train: 0.015850 RMSE valid: 0.035650
 LBFGS step 309/1000 Loss: -1888.689203 RMSE train: 0.015852 RMSE valid: 0.035641 best RMSE valid/CO: 0.014334
 LBFGS step 310/1000 Loss: -1888.691722 RMSE train: 0.015858 RMSE valid: 0.035673 best RMSE valid/CO: 0.014334
 LBFGS step 311/1000 Loss: -1888.702315 RMSE train: 0.015879 RMSE valid: 0.035557 best RMSE valid/CO: 0.014334
-Loss dropped by only 0.476841 (< loss_tol=0.5) over the last 20 steps, stopping (best RMSE valid=0.014334 at step 262).
+Loss dropped by only 0.476841 (< loss_plateau_tol=0.5) over the last 20 steps, stopping (best RMSE valid/CO=0.014334 at step 262).
 Fold 2: best RMSE valid = 0.014334 (no test set given)
 
 Fold 3/5
@@ -1144,7 +1145,7 @@ LBFGS step 369/1000 Loss: -1809.101858 RMSE train: 0.019593 RMSE valid: 0.195740
 LBFGS step 370/1000 Loss: -1809.128244 RMSE train: 0.019599 RMSE valid: 0.199289 best RMSE valid/CO: 0.025859
 LBFGS step 371/1000 Loss: -1809.151262 RMSE train: 0.019605 RMSE valid: 0.197527 best RMSE valid/CO: 0.025859
 LBFGS step 372/1000 Loss: -1809.174612 RMSE train: 0.019607 RMSE valid: 0.194824 best RMSE valid/CO: 0.025859
-Loss dropped by only 0.425111 (< loss_tol=0.5) over the last 20 steps, stopping (best RMSE valid=0.025859 at step 162).
+Loss dropped by only 0.425111 (< loss_plateau_tol=0.5) over the last 20 steps, stopping (best RMSE valid/CO=0.025859 at step 162).
 Fold 3: best RMSE valid = 0.025859 (no test set given)
 
 Fold 4/5
@@ -1469,7 +1470,7 @@ LBFGS step 318/1000 Loss: -1916.054489 RMSE train: 0.013966 RMSE valid: 0.050747
 LBFGS step 319/1000 Loss: -1916.063467 RMSE train: 0.013972 RMSE valid: 0.052151 best RMSE valid/CO: 0.013337
 LBFGS step 320/1000 Loss: -1916.091104 RMSE train: 0.013968 RMSE valid: 0.052412 best RMSE valid/CO: 0.013337
 LBFGS step 321/1000 Loss: -1916.105310 RMSE train: 0.013967 RMSE valid: 0.051515 best RMSE valid/CO: 0.013337
-Loss dropped by only 0.445988 (< loss_tol=0.5) over the last 20 steps, stopping (best RMSE valid=0.013337 at step 152).
+Loss dropped by only 0.445988 (< loss_plateau_tol=0.5) over the last 20 steps, stopping (best RMSE valid/CO=0.013337 at step 152).
 Fold 4: best RMSE valid = 0.013337 (no test set given)
 
 Fold 5/5
@@ -1836,12 +1837,12 @@ LBFGS step 360/1000 Loss: -1937.483235 RMSE train: 0.014323 RMSE valid: 0.060833
 LBFGS step 361/1000 Loss: -1937.489590 RMSE train: 0.014332 RMSE valid: 0.060908 best RMSE valid/CO: 0.015292
 LBFGS step 362/1000 Loss: -1937.500500 RMSE train: 0.014340 RMSE valid: 0.060947 best RMSE valid/CO: 0.015292
 LBFGS step 363/1000 Loss: -1937.507835 RMSE train: 0.014349 RMSE valid: 0.060970 best RMSE valid/CO: 0.015292
-Loss dropped by only 0.482652 (< loss_tol=0.5) over the last 20 steps, stopping (best RMSE valid=0.015292 at step 58).
+Loss dropped by only 0.482652 (< loss_plateau_tol=0.5) over the last 20 steps, stopping (best RMSE valid/CO=0.015292 at step 58).
 Fold 5: best RMSE valid = 0.015292 (no test set given)
 
 KFold summary (LBFGS): RMSE valid = 0.016548 +/- 0.004699
 
-Best fold: 4 (RMSE valid=0.013337) -> models\ads\model_fold_4.pt
+Best fold: 4 (RMSE valid/CO=0.013337) -> models\ads\model_fold_4.pt
 Reloaded best checkpoint from models\ads\model_fold_4.pt
 Copied best checkpoint -> models\ads\model_best.pt
 Final metrics: {'rmse_train': 0.024005226344437056, 'rmse_valid': 0.043417581702811736, 'mae_train': 0.014985695850394332, 'mae_valid': 0.026112516427612607}

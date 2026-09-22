@@ -55,13 +55,13 @@
   },
   "training": {
     "method": "kfold_lbfgs",
-    "select_by_rmse_per_co": true,
+    "best_model_metric": "rmse_valid_per_co",
     "lbfgs": {
       "n_steps": 1000,
       "max_iter": 20,
       "lr": 0.1,
-      "early_stop_patience": 20,
-      "loss_tol": 0.5
+      "loss_plateau_window": 20,
+      "loss_plateau_tol": 0.5
     },
     "kfold": {
       "n_splits": 5,

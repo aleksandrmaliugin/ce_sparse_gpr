@@ -506,9 +506,20 @@ def run(config_path: str, warm_start_fallback: str | None = None, save_plot: boo
                 fold_results = result["summary"]["fold_results"]
                 best_fold = min(fold_results, key=lambda r: r["best_rmse_valid"])
                 best_model_path = best_fold["model_path"]
+                # best_rmse_valid's own scale depends on best_model_metric: it
+                # is RMSE/CO for "rmse_valid_per_co", and plain RMSE valid for
+                # both "rmse_valid" and "loss" (train_lbfgs reports the raw
+                # RMSE valid AT the lowest-loss step in that last case - see
+                # its docstring) - label it accordingly, not always "RMSE
+                # valid", or the two scales get silently conflated in the log.
+                best_metric_label = (
+                    "RMSE valid/CO"
+                    if cfg["training"].get("best_model_metric") == "rmse_valid_per_co"
+                    else "RMSE valid"
+                )
                 print(
                     f"\nBest fold: {best_fold['fold']} "
-                    f"(RMSE valid={best_fold['best_rmse_valid']:.6f}) -> {best_model_path}"
+                    f"({best_metric_label}={best_fold['best_rmse_valid']:.6f}) -> {best_model_path}"
                 )
                 train_y_t = torch.as_tensor(train_y)
                 plot_valid_x, plot_valid_y = select_by_indices(train_x, train_y_t, best_fold["valid_idx"])

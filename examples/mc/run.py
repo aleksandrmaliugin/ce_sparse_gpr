@@ -9,9 +9,13 @@ stub:
   1. reads that POSCAR,
   2. sleeps a random duration to stand in for a real relaxation's wall time,
   3. predicts its energy from the CURRENT slab+ads models (the same
-     checkpoints the running MC uses) - optionally jittered by a small
-     Gaussian to avoid every "DFT" point landing exactly on the model's own
-     mean (which would teach a retraining cycle nothing new),
+     checkpoints the running MC uses), plus n_co * E_CO_gas (a fixed,
+     genuine DFT reference value, not a prediction - see CO_GAS_OUTCAR) so
+     the result looks like a real DFT total energy of a CO-covered
+     structure rather than just the ads model's own (already CO-gas- and
+     slab-referenced) e_ads_total - optionally jittered by a small Gaussian
+     to avoid every "DFT" point landing exactly on the model's own mean
+     (which would teach a retraining cycle nothing new),
   4. writes the outputs active_learning's _run_dft expects: final_marker
      (default "final.traj", just the unrelaxed input structure - this stub
      does not actually relax anything) and energy_file (default "final.e"),
@@ -36,11 +40,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR.parent.parent))  # repo root: ce_sparse_gpr package, ce_gpr_train.py
 
 from ce_sparse_gpr.calculator import CalculatorCESparseGPR  # noqa: E402
+import make_database as mdb  # noqa: E402 - repo root, same sys.path entry as above
 
 # Must match mc_grand.example.json's "models" section (paths are resolved
 # relative to THIS file, not to the job directory this script runs in).
 SLAB_MODEL = SCRIPT_DIR / "../training/models/clean/model_best.pt"
-ADS_MODEL = SCRIPT_DIR / "../../runs/ads_unified_rep_descriptor/model_fold_1.pt"
+ADS_MODEL = SCRIPT_DIR / "../training/models/ads/model_best.pt"
+# Must match mc_grand.test.json's active_learning.co_gas_outcar.
+CO_GAS_OUTCAR = SCRIPT_DIR / "../../_datasets/low_cov/CO_gase/OUTCAR"
 
 POSCAR_NAME = "in.poscar"
 FINAL_TRAJ_NAME = "final.traj"
@@ -48,7 +55,16 @@ FINAL_ENERGY_NAME = "final.e"
 OUTCAR_NAME = "OUTCAR"
 
 SLEEP_RANGE_SECONDS = (2.0, 8.0)
-NOISE_STD_EV = 0.01  # set to 0.0 for the model's exact, un-jittered prediction
+NOISE_STD_EV = 0.001  # set to 0.0 for the model's exact, un-jittered prediction
+
+_co_gas_energy_cache: float | None = None
+
+
+def _co_gas_energy() -> float:
+    global _co_gas_energy_cache
+    if _co_gas_energy_cache is None:
+        _co_gas_energy_cache = mdb.load_co_gas_energy(CO_GAS_OUTCAR)
+    return _co_gas_energy_cache
 
 
 def fake_relax(atoms):
@@ -61,6 +77,21 @@ def fake_relax(atoms):
     )
     _, total_energy, _ = calculator(atoms)
     energy = float(total_energy.item())
+
+    # CalculatorCESparseGPR's total_energy is E_slab + E_ads, where E_ads IS
+    # the ads model's own target (e_ads_total = E_total(DFT) - E_slab -
+    # n_co*E_CO_gas) - it does NOT add the n_co*E_CO_gas term back in, so on
+    # its own it is not a plausible raw DFT total energy for a CO-covered
+    # structure (a real VASP total energy includes the atoms that make up
+    # the adsorbed CO). Without this term, active_learning.run_cycle's own
+    # e_ads_total = energy - (slab_energy + n_co*co_energy) recovers a value
+    # short by n_co*E_CO_gas - e.g. ~+96.7 eV too high at n_co=8 (8 * -12.09
+    # eV), which is exactly the sign and rough size of the nonsense
+    # e_ads_total values seen in al_test_ads.db before this fix.
+    n_co = atoms.get_chemical_symbols().count("C")
+    if n_co > 0:
+        energy += n_co * _co_gas_energy()
+
     if NOISE_STD_EV > 0.0:
         energy += random.gauss(0.0, NOISE_STD_EV)
     return atoms, energy

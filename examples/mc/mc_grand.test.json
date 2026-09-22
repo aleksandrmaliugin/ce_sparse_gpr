@@ -45,7 +45,7 @@
   },
 
   "active_learning": {
-    "enabled": false,
+    "enabled": true,
     "run_script": "run.py",
     "run_dir": "active_learning_runs",
     "poscar_name": "in.poscar",
@@ -53,7 +53,7 @@
     "energy_file": "final.e",
     "uncertainty_thresholds": {
       "slab": 10.05,
-      "ads": 0.35
+      "ads": 0.45
     },
     "datasets": {
       "slab": "datasets/al_test_slab.db",
@@ -63,6 +63,6 @@
       "slab": "al_train_slab.test.json",
       "ads": "al_train_ads.test.json"
     },
-    "co_gas_outcar": "../../datasets/low_cov/CO_gase/OUTCAR"
+    "co_gas_outcar": "../../_datasets/low_cov/CO_gase/OUTCAR"
   }
 }

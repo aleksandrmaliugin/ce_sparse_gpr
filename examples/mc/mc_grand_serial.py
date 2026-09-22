@@ -1080,17 +1080,18 @@ class ActiveLearningController:
     component's own ase.db, the corresponding SparseAtomicGPR is retrained
     via ce_gpr_train.run(), and the freshly retrained checkpoint is hot
     swapped into the running evaluator before MC resumes - see run_cycle.
+
+    An "ads" trigger costs TWO DFT relaxations, not one: the CO-covered
+    structure, and this same alloy with every CO removed (the bare-slab
+    reference e_ads_total needs). Only the CO-covered one is kept - the
+    bare-slab one is used solely as a reference value and is NOT folded
+    into the slab dataset (that dataset only grows on a slab-triggered
+    cycle, deliberately, to keep the two components' retraining decoupled).
     """
 
     COMPONENTS = ("slab", "ads")
 
-    def __init__(
-        self,
-        cfg: dict,
-        slab_model_path: str,
-        device: str = "cpu",
-        allow_unsafe_load: bool = False,
-    ):
+    def __init__(self, cfg: dict):
         self.thresholds = {
             name: float(cfg.get("uncertainty_thresholds", {}).get(name, float("inf")))
             for name in self.COMPONENTS
@@ -1110,19 +1111,6 @@ class ActiveLearningController:
         # starting at job_00001 and colliding with them.
         self._counter = self._max_existing_job_number()
         self._co_energy: float | None = None
-
-        # Own slab-only predictor, independent of whichever MC evaluator is
-        # running (Local or Calculator) - run_cycle needs a predicted E_slab
-        # for the freshly-relaxed (possibly alloy-mutated) DFT structure to
-        # compute e_ads_total, which isn't naturally something every
-        # evaluator variant exposes for an arbitrary (non-MC-site-aligned)
-        # atoms object. Kept in sync with the live evaluator via
-        # _sync_predictor below.
-        self._predictor = CalculatorCESparseGPR(
-            file_slab_model=slab_model_path,
-            device=device,
-            allow_unsafe_load=allow_unsafe_load,
-        )
 
     def triggered_component(self, energy: EnergyComponents, n_co: int) -> str | None:
         """Return the first component whose uncertainty exceeds its own
@@ -1222,13 +1210,21 @@ class ActiveLearningController:
             atoms = evaluator.make_atoms(state.slab_atoms, state.occupation)
             relaxed_atoms, energy = self._run_dft(atoms)
 
-            # This controller's OWN predictor (kept in sync via
-            # _sync_predictor, independent of the running MC evaluator) -
-            # same formula as compute_e_ads_total_exact, but with a
-            # MODEL-predicted E_slab (this alloy's exact clean-slab DFT
-            # energy isn't available mid-MC, unlike in dataset construction).
-            slab_energy, _, _ = self._predictor(relaxed_atoms)
-            slab_energy = float(slab_energy.item())
+            # Real DFT slab-only reference: same formula as
+            # compute_e_ads_total_exact, but the bare-slab counterpart (this
+            # alloy with every CO removed) is now a SECOND _run_dft call
+            # instead of a slab-model prediction. The prediction shortcut let
+            # the slab model's own error leak straight into e_ads_total -
+            # e.g. two al_test_ads.db rows ended up with e_ads_total > +80 eV
+            # (physically should be ~-10 eV at their n_co=8) because the slab
+            # model badly mispredicted that alloy composition. This costs one
+            # extra DFT relaxation per "ads"-triggered cycle. Used only as a
+            # reference value here - NOT folded into the slab dataset (that
+            # would grow it on every "ads" trigger too, coupling the two
+            # components' retraining, which we don't want).
+            bare_atoms = evaluator.make_atoms(state.slab_atoms, np.zeros_like(state.occupation))
+            _, slab_energy = self._run_dft(bare_atoms)
+
             co_energy = self._co_gas_energy()
 
             e_ads_total = energy - (slab_energy + n_co * co_energy)
@@ -1252,17 +1248,6 @@ class ActiveLearningController:
         )
         print(f"[active learning] retrained {component} model -> {new_model_path}", flush=True)
         evaluator.reload_model(component, str(new_model_path))
-        self._sync_predictor(component, str(new_model_path))
-
-    def _sync_predictor(self, component: str, model_path: str) -> None:
-        """Keep this controller's own predictor in step with a component
-        that was just retrained (slab only - self._predictor never carries
-        an ads model, since its own e_ads_total formula never needs one)."""
-        if component != "slab":
-            return
-        model = _load_sparse_model(model_path, self._predictor.device or "cpu", self._predictor.allow_unsafe_load)
-        setattr(self._predictor, "slab_model", model)
-        setattr(self._predictor, "slab_extractor", ClusterExpansion(model.config))
 
 
 class GrandCO_MC:
@@ -1649,12 +1634,7 @@ def main() -> None:
         )
 
     active_learning = (
-        ActiveLearningController(
-            al_cfg,
-            slab_model_path=args.slab_model,
-            device=args.device,
-            allow_unsafe_load=args.allow_unsafe_model_load,
-        )
+        ActiveLearningController(al_cfg)
         if al_cfg and al_cfg.get("enabled", False)
         else None
     )

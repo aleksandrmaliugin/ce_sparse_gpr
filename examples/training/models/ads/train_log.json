@@ -1,8 +1,8 @@
 {
   "method": "kfold_lbfgs",
   "summary": {
-    "rmse_valid_mean": 0.016548413216674218,
-    "rmse_valid_std": 0.004698511379652519,
+    "rmse_valid_mean": 0.07619003444625885,
+    "rmse_valid_std": 0.060029225500452366,
     "fold_results": [
       {
         "fold": 1,
@@ -1093,9 +1093,9 @@
             0.03800804812763777,
             0.038083952028978026
           ],
-          "best_step": 102
+          "best_step": 360
         },
-        "best_rmse_valid": 0.013921063641348609,
+        "best_rmse_valid": 0.038083952028978026,
         "rmse_test": null,
         "train_idx": [
           1,
@@ -2849,9 +2849,9 @@
             0.03567269781231904,
             0.03555724526820994
           ],
-          "best_step": 262
+          "best_step": 311
         },
-        "best_rmse_valid": 0.014334091669346186,
+        "best_rmse_valid": 0.03555724526820994,
         "rmse_test": null,
         "train_idx": [
           0,
@@ -4788,9 +4788,9 @@
             0.19752682816975872,
             0.19482369710685557
           ],
-          "best_step": 162
+          "best_step": 372
         },
-        "best_rmse_valid": 0.02585859597788315,
+        "best_rmse_valid": 0.19482369710685557,
         "rmse_test": null,
         "train_idx": [
           0,
@@ -6574,9 +6574,9 @@
             0.05241217808929263,
             0.05151509176941174
           ],
-          "best_step": 152
+          "best_step": 321
         },
-        "best_rmse_valid": 0.013336773379051634,
+        "best_rmse_valid": 0.05151509176941174,
         "rmse_test": null,
         "train_idx": [
           0,
@@ -8486,9 +8486,9 @@
             0.06094680424991948,
             0.06097018605783902
           ],
-          "best_step": 58
+          "best_step": 363
         },
-        "best_rmse_valid": 0.015291541415741511,
+        "best_rmse_valid": 0.06097018605783902,
         "rmse_test": null,
         "train_idx": [
           0,

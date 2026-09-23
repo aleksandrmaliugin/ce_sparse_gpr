@@ -1,12 +1,12 @@
 {
-  "rmse_train": 0.024005226344437056,
-  "rmse_valid": 0.043417581702811736,
-  "mae_train": 0.014985695850394332,
-  "mae_valid": 0.026112516427612607,
-  "rmse_train_per_co": 0.011545933544031784,
-  "mae_train_per_co": 0.008019953971176288,
-  "rmse_valid_per_co": 0.013336773379051634,
-  "mae_valid_per_co": 0.009983167560934503,
-  "best_model_path": "models\\ads\\model_fold_4.pt",
+  "rmse_train": 0.02132686668399074,
+  "rmse_valid": 0.035557245268209935,
+  "mae_train": 0.014017214033011456,
+  "mae_valid": 0.022644842885434866,
+  "rmse_train_per_co": 0.011536423092264589,
+  "mae_train_per_co": 0.00785519890047733,
+  "rmse_valid_per_co": 0.014587692947954228,
+  "mae_valid_per_co": 0.01035999909697891,
+  "best_model_path": "models\\ads\\model_fold_2.pt",
   "best_model_copy_path": "models\\ads\\model_best.pt"
 }

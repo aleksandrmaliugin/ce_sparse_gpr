@@ -1087,11 +1087,30 @@ class ActiveLearningController:
     bare-slab one is used solely as a reference value and is NOT folded
     into the slab dataset (that dataset only grows on a slab-triggered
     cycle, deliberately, to keep the two components' retraining decoupled).
+
+    Every relaxed structure is run through make_database.standardize_relaxed_atoms
+    before it can enter a dataset - the SAME site-matching/geometry check the
+    original dataset was built with (see _standardize_or_reject). A real DFT
+    relaxation can move CO off its assigned site, merge two sites, or shift
+    substrate atoms; without this, such a structure would enter training
+    verbatim, with a stale n_co (computed from the pre-relaxation MC
+    occupation, not from where the atoms actually ended up) and raw
+    (non-canonical) coordinates unlike every other row already in the
+    dataset. A structure that fails this check is discarded outright: no
+    dataset row, no retrain, for that cycle - the sunk DFT cost is the price
+    of not silently poisoning the training set.
     """
 
     COMPONENTS = ("slab", "ads")
 
-    def __init__(self, cfg: dict):
+    def __init__(
+        self,
+        cfg: dict,
+        lattice_constant: float,
+        vacuum: float,
+        co_height: float,
+        co_bond: float,
+    ):
         self.thresholds = {
             name: float(cfg.get("uncertainty_thresholds", {}).get(name, float("inf")))
             for name in self.COMPONENTS
@@ -1104,6 +1123,21 @@ class ActiveLearningController:
         self.datasets: dict[str, str] = dict(cfg["datasets"])
         self.train_configs: dict[str, str] = dict(cfg["train_configs"])
         self.co_gas_outcar = cfg.get("co_gas_outcar")
+        # Passed straight through to make_database.standardize_relaxed_atoms
+        # (see _standardize_or_reject) - the same geometry convention this
+        # MC run itself was built with (structure.lattice_constant/vacuum,
+        # mc.co_height/co_bond), so a "clean" relaxation standardizes back to
+        # the exact lattice this run started from. slab_match_cutoff,
+        # site_match_cutoff and layer_z_tol are deliberately NOT threaded
+        # through from mc.* - those are drift-tolerance thresholds for real
+        # DFT relaxation noise, a different thing from this MC's own
+        # (noiseless, frozen-lattice) layer_z_tol - left at
+        # standardize_relaxed_atoms's own defaults, the same ones the
+        # original dataset was filtered with.
+        self.lattice_constant = float(lattice_constant)
+        self.vacuum = float(vacuum)
+        self.co_height = float(co_height)
+        self.co_bond = float(co_bond)
 
         self.run_dir.mkdir(parents=True, exist_ok=True)
         # Resume numbering after whatever job_NNNNN dirs already exist (e.g.
@@ -1135,6 +1169,39 @@ class ActiveLearningController:
                 else mdb.load_co_gas_energy()
             )
         return self._co_energy
+
+    def _standardize_or_reject(self, relaxed_atoms, label: str):
+        """Run a freshly DFT-relaxed structure through the SAME
+        standardization/site-matching the original dataset was built with
+        (make_database.standardize_relaxed_atoms): reconstructs the
+        canonical ideal-lattice geometry from the actual relaxed positions,
+        and re-derives n_co/n_ontop/n_bridge/site labels from where the
+        atoms actually ended up.
+
+        Returns (geometry, flags) on success. Returns None, having already
+        printed why, if the relaxation drifted too far to match cleanly (CO
+        desorbed/migrated/merged onto another site, or a substrate atom
+        moved off its lattice point) - the same rejection this structure
+        would have gotten had it turned up during the original dataset
+        build, via standardize_relaxed_atoms's own slab_match_cutoff/
+        site_match_cutoff/layer_z_tol defaults (see __init__)."""
+        import make_database as mdb
+
+        try:
+            return mdb.standardize_relaxed_atoms(
+                relaxed_atoms,
+                lattice_constant=self.lattice_constant,
+                vacuum=self.vacuum,
+                ads_height=self.co_height,
+                co_bond=self.co_bond,
+            )
+        except ValueError as exc:
+            print(
+                f"[active learning] {label}: relaxed geometry failed standardization "
+                f"({exc}) - discarding this AL cycle, no dataset row added.",
+                flush=True,
+            )
+            return None
 
     def _max_existing_job_number(self) -> int:
         max_n = 0
@@ -1197,18 +1264,40 @@ class ActiveLearningController:
     ) -> None:
         import make_database as mdb
 
-        n_co = int(np.asarray(state.occupation, dtype=bool).sum())
-
         if component == "slab":
             # The slab model is trained on bare-alloy DFT points only - probe
             # it at zero CO coverage regardless of the MC's current occupation.
             atoms = evaluator.make_atoms(state.slab_atoms, np.zeros_like(state.occupation))
             relaxed_atoms, energy = self._run_dft(atoms)
-            mdb.append_row_to_db(self.datasets["slab"], relaxed_atoms, energy)
+
+            standardized = self._standardize_or_reject(relaxed_atoms, "slab")
+            if standardized is None:
+                return
+            geometry, flags = standardized
+
+            mdb.append_row_to_db(self.datasets["slab"], geometry, energy, **flags)
 
         else:
             atoms = evaluator.make_atoms(state.slab_atoms, state.occupation)
             relaxed_atoms, energy = self._run_dft(atoms)
+
+            standardized = self._standardize_or_reject(relaxed_atoms, "ads")
+            if standardized is None:
+                return
+            geometry, flags = standardized
+
+            # n_co from the ACTUAL relaxed geometry (flags["n_co"]), not the
+            # pre-relaxation MC occupation - a real relaxation can desorb or
+            # move a CO, which would otherwise tag this row with a coverage
+            # it no longer has.
+            n_co = flags["n_co"]
+            if n_co == 0:
+                print(
+                    "[active learning] ads: relaxed structure has n_co=0 "
+                    "(every CO desorbed/drifted off-site) - discarding this AL cycle.",
+                    flush=True,
+                )
+                return
 
             # Real DFT slab-only reference: same formula as
             # compute_e_ads_total_exact, but the bare-slab counterpart (this
@@ -1221,15 +1310,19 @@ class ActiveLearningController:
             # extra DFT relaxation per "ads"-triggered cycle. Used only as a
             # reference value here - NOT folded into the slab dataset (that
             # would grow it on every "ads" trigger too, coupling the two
-            # components' retraining, which we don't want).
+            # components' retraining, which we don't want). Still run through
+            # the same standardization check: a reference that itself
+            # drifted too far isn't trustworthy either.
             bare_atoms = evaluator.make_atoms(state.slab_atoms, np.zeros_like(state.occupation))
-            _, slab_energy = self._run_dft(bare_atoms)
+            slab_relaxed_atoms, slab_energy = self._run_dft(bare_atoms)
+            if self._standardize_or_reject(slab_relaxed_atoms, "ads (bare-slab reference)") is None:
+                return
 
             co_energy = self._co_gas_energy()
 
             e_ads_total = energy - (slab_energy + n_co * co_energy)
             mdb.append_row_to_db(
-                self.datasets["ads"], relaxed_atoms, energy, n_co=n_co, e_ads_total=e_ads_total
+                self.datasets["ads"], geometry, energy, e_ads_total=e_ads_total, **flags
             )
 
         print(f"[active learning] retraining {component} model ...", flush=True)
@@ -1634,7 +1727,13 @@ def main() -> None:
         )
 
     active_learning = (
-        ActiveLearningController(al_cfg)
+        ActiveLearningController(
+            al_cfg,
+            lattice_constant=args.lattice_constant,
+            vacuum=args.vacuum,
+            co_height=args.co_height,
+            co_bond=args.co_bond,
+        )
         if al_cfg and al_cfg.get("enabled", False)
         else None
     )

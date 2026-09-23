@@ -36,7 +36,7 @@
 
   "training": {
     "method": "kfold_lbfgs",
-    "best_model_metric": "rmse_valid_per_co",
+    "best_model_metric": "loss",
     "lbfgs": {
       "n_steps": 1000,
       "max_iter": 20,
